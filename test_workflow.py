@@ -1,0 +1,148 @@
+"""Dados sintéticos no formato de coleta; nenhum dado real ou identificação pessoal."""
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from eeg import load_run, make_epochs, scan, selection, settings, trials_from_markers
+from classify import evaluate, prepare, trial_splits
+
+
+def synthetic(root, n=16, classes=("LEFT", "RIGHT")):
+    path = root / "AB01" / "S1" / "IM_treino"
+    path.mkdir(parents=True)
+    sfreq = 128
+    times = np.arange(0, n * 10 + 12, 1 / sfreq)
+    rng   = np.random.default_rng(24)
+    data  = rng.normal(0, 2, (len(times), 15))
+    rows  = []
+    for i in range(n):
+        attempt = 6 + i * 10
+        cls     = classes[i % len(classes)]
+        for label, time in [("ATTENTION", attempt - 1.5), (f"{cls}_MI_STIM", attempt - 0.5),
+                            ("ATTEMPT", attempt), ("PAUSE", attempt + 3.75)]:
+            rows.append(dict(label=label, lsl_time_s=1000 + time))
+        mask = (times >= attempt) & (times < attempt + 3.75)
+        ch   = 3 if cls == "LEFT" else 9
+        data[mask, ch] += 8 * np.sin(2 * np.pi * 10 * times[mask])
+    signal = pd.DataFrame(data, columns=[f"ch{i}" for i in range(1, 16)])
+    signal.insert(0, "lsl_time_s", times + 1000)
+    signal.to_csv(path / "test_signal_20260101_120000.csv", index=False)
+    pd.DataFrame(rows).to_csv(path / "test_markers_20260101_120000.csv", index=False)
+    control          = root / "dataset_index.csv"
+    index            = scan(root, control)
+    index["include"] = True
+    index.to_csv(control, index=False)
+    return control
+
+
+def quick_config():
+    cfg = settings()
+    cfg.update(windows=[1.0], offsets=[0.5], bands=[[[8, 30]]], svm_c=[1.0],
+               outer_folds=2, inner_folds=2, search_budget=1, dpi=72)
+    return cfg
+
+
+def test_control_preserved_and_relocated(tmp_path):
+    control                 = synthetic(tmp_path)
+    frame                   = pd.read_csv(control)
+    frame["exclude_trials"] = "1,3"
+    frame["bad_channels"]   = "CPz"
+    frame.to_csv(control, index=False)
+    indexed = scan(tmp_path, control)
+    assert indexed.include.all()
+    assert indexed.exclude_trials.iloc[0] == "1,3"
+    assert not Path(indexed.signal_path.iloc[0]).is_absolute()
+    cfg              = quick_config()
+    run              = load_run(tmp_path, indexed.iloc[0], cfg)
+    _, epochs, audit = make_epochs(run, cfg)
+    assert not {1, 3} & set(epochs.metadata.trial)
+    assert run.clean.info["bads"] == ["CPz"]
+    assert audit.accepted.all()
+
+
+def test_missing_pause_and_invalid_sequence():
+    markers = pd.DataFrame(dict(label=["ATTENTION", "LEFT_MI_STIM", "ATTEMPT", "ATTENTION", "ATTEMPT"],
+                                lsl_time_s=[1, 2, 3, 8, 10]))
+    trials  = trials_from_markers(markers, 20, 3.75)
+    assert trials.pause_start.iloc[0] == 6.75
+    assert trials.pause_source.iloc[0] == "inferred"
+    assert not trials.valid.iloc[1]
+
+
+def test_nested_cv_no_trial_leakage_and_probabilities(tmp_path):
+    control      = synthetic(tmp_path)
+    cfg          = quick_config()
+    row          = selection(control).iloc[0]
+    run          = load_run(tmp_path, row, cfg)
+    _, epochs, _ = make_epochs(run, cfg)
+    accepted     = set(epochs.metadata.trial)
+    data, _      = prepare(run, cfg, "left_right", accepted)
+    meta         = data[0][2]
+    for tr, te in trial_splits(meta, 2, 42):
+        assert not set(meta.trial.iloc[tr]) & set(meta.trial.iloc[te])
+    summary, predictions, phase = evaluate(run, cfg, "left_right", accepted)
+    assert predictions.groupby("trial").fold.nunique().eq(1).all()
+    assert np.allclose(predictions[["p_LEFT", "p_RIGHT"]].sum(axis=1), 1)
+    assert summary["n_trials"] == len(accepted)
+    assert len(phase) == len(accepted)
+    for fold in summary["folds"]:
+        assert not set(fold["train_trials"]) & set(fold["test_trials"])
+
+
+def test_irregular_timestamps_fail(tmp_path):
+    control                     = synthetic(tmp_path, n=4)
+    row                         = selection(control).iloc[0]
+    path                        = tmp_path / row.signal_path
+    frame                       = pd.read_csv(path)
+    frame.loc[10, "lsl_time_s"] = frame.loc[9, "lsl_time_s"]
+    frame.to_csv(path, index=False)
+    with pytest.raises(ValueError, match="duplicados"):
+        load_run(tmp_path, row, quick_config())
+
+
+@pytest.mark.parametrize("pipeline", ["tgsp", "csp"])
+def test_all_protocols_filterbank_and_csp(tmp_path, pipeline):
+    control      = synthetic(tmp_path, n=24, classes=("LEFT", "RIGHT", "REST_STIM"))
+    run          = load_run(tmp_path, selection(control).iloc[0], quick_config())
+    _, epochs, _ = make_epochs(run, quick_config())
+    accepted     = set(epochs.metadata.trial)
+    cfg          = quick_config()
+    cfg.update(bands=[[[8, 13], [13, 30]]], pipelines=[pipeline], offsets=[0.0])
+    for protocol in ["reststim_move", "attention_move", "rest_left_right"]:
+        summary, predictions, _ = evaluate(run, cfg, protocol, accepted)
+        assert summary["n_trials"] >= 16
+        assert summary["rest_source"] == "REST_STIM"
+        assert predictions.groupby("trial").fold.nunique().eq(1).all()
+
+
+def test_report_and_interface(tmp_path):
+    from analyze import batch
+    from streamlit.testing.v1 import AppTest
+    control = synthetic(tmp_path, n=8)
+    output  = tmp_path / "reports"
+    results = batch(tmp_path, control, output, quick_config(), mode="ephys", detailed=True)
+    assert results[0]["status"] == "ok"
+    folder = output / results[0]["run_id"]
+    for name in ["report.html", "dashboard.png", "topografias_mu_beta.pdf", "pca_2d_3d.png", "baseline_audit.csv"]:
+        assert (folder / name).stat().st_size > 100
+    assert "Trial 0" in (folder / "report.html").read_text()
+    at = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
+    at.sidebar.text_input[0].set_value(str(tmp_path)).run()
+    assert not list(at.exception)
+    assert [t.label for t in at.tabs] == ["Controle dos dados", "Produzir relatório", "Consultar resultados"]
+
+
+def test_online_requires_prior_included_calibration(tmp_path):
+    from analyze import calibration_row
+    control              = synthetic(tmp_path, n=4)
+    included             = selection(control)
+    online               = included.iloc[0].copy()
+    online["stamp"]      = "20260101_130000"
+    online["block_type"] = "online_com_feedback"
+    assert calibration_row(online, included).run_id == included.iloc[0].run_id
+    online["stamp"] = "20260101_110000"
+    with pytest.raises(ValueError, match="anterior"):
+        calibration_row(online, included)
