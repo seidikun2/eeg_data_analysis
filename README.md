@@ -89,6 +89,40 @@ executadas independentemente com `--mode ephys` ou `--mode classification`.
 O comando termina com código 1 se um registro ou protocolo solicitado não puder ser analisado;
 os resultados bem-sucedidos são preservados e o motivo consta no HTML/JSON.
 
+## Check antes do batch
+
+Na interface, clique em **Verificar dados antes da análise**, depois de salvar a tabela.
+Pelo terminal:
+
+```bash
+python analyze.py check --root "/caminho/dados" --subjects AB01
+```
+
+O check não treina modelos. Ele verifica os dois CSVs independentemente, leitura e colunas,
+relógio, marcadores nas bordas, pré-processamento, sequência/duração de fases, rejeição de
+épocas, baseline em PAUSA, classes e disponibilidade de folds por trial. Candidatos com
+janelas/offsets que não suportam CV são descartados antes de calcular a interseção de trials;
+um candidato inviável não deve inutilizar os candidatos mais curtos.
+
+Saídas: `diagnostics.html`, `diagnostics.csv`, `diagnostics.json` e um JSON por registro.
+Cada item informa etapa, `ok`/`warning`/`error`, mensagem e ação recomendada. O JSON contém
+configuração, QC, durações das fases e rejeições. O diagnóstico é salvo por registro, mesmo
+que outros registros falhem; arquivos ausentes também aparecem. Apenas registros incluídos
+pelos filtros e controle são verificados. O check é executado automaticamente antes do batch.
+Falhas posteriores da análise geram também `error_traceback.txt` no diretório do registro.
+
+Marcadores ligeiramente anteriores/posteriores ao EEG não bloqueiam o bloco inteiro:
+seus tempos originais são preservados e a distância às bordas é registrada. Trials precisam
+ter ATTEMPT dentro do sinal; épocas sem EEG suficiente são rejeitadas pelo MNE. Na classificação,
+o segmento é limitado às amostras disponíveis. Se nenhum marcador sobrepõe o EEG, a leitura
+continua bloqueada para investigar sincronização.
+
+Quando a baseline não cai em PAUSA, o check procura um intervalo comum nas PAUSAs anteriores
+com margem de 250 ms e duração mínima de 500 ms, e registra `suggested_erd_config` quando possível.
+A sugestão inclui ampliar o contexto pré-ATTEMPT; **não é aplicada automaticamente**. Revise-a
+em uma cópia do JSON e execute novamente o check. O primeiro trial pode continuar sem baseline.
+Um check `ok` não certifica ausência de artefatos nem substitui inspeção ou ajuste numérico do modelo.
+
 ## Eletrofisiologia
 
 - Sanity checks: finitude, monotonicidade, amostragem/jitter/gaps/drift, limites dos marcadores,

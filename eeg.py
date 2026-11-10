@@ -243,8 +243,14 @@ def load_run(root, row, cfg):
     if not np.isfinite(markers.lsl_time_s.to_numpy(float)).all():
         raise ValueError("Timestamp de marcador inválido.")
     markers = markers.sort_values("lsl_time_s").reset_index(drop=True)
-    if (markers.lsl_time_s < times[0]).any() or (markers.lsl_time_s > times[-1]).any():
-        raise ValueError("Marcadores fora do intervalo do sinal; conferir relógios LSL.")
+    outside = (markers.lsl_time_s < times[0]) | (markers.lsl_time_s > times[-1])
+    marker_bounds = dict(outside_count=int(outside.sum()),
+                         before_s=float(max(0, times[0] - markers.lsl_time_s.min())),
+                         after_s=float(max(0, markers.lsl_time_s.max() - times[-1])))
+    if not markers.lsl_time_s.between(times[0], times[-1]).any():
+        raise ValueError("Nenhum marcador sobrepõe o sinal; conferir relógios LSL.")
+    if outside.any():
+        warnings.warn("Marcadores nas bordas/fora do sinal: registrados no QC, sem deslocar ou recortar timestamps.", RuntimeWarning)
     names = [CHANNEL_MAP.get(c, c.upper()) for c in cols]
     raw   = mne.io.RawArray(data, mne.create_info(names, sfreq, "eeg"), verbose=False)
     raw.set_montage("colin27_1020", on_missing="raise", verbose=False)
@@ -269,9 +275,9 @@ def load_run(root, row, cfg):
         raise ValueError("exclude_trials contém IDs inexistentes (IDs começam em zero).")
     trials["manual_exclusion"] = trials.trial.isin(excluded)
     trials["valid"] &= ~trials.manual_exclusion
-    trials["valid"] &= trials.attention_start >= times[0]
+    trials["valid"] &= trials.attempt_start.between(times[0], times[-1])
     qc = dict(sfreq=sfreq, n_samples=len(times), duration_s=float(times[-1] - times[0]),
-              jitter_p99=jitter, timestamp_drift_s=drift, timing=timing, channels=names, bad_channels=bads,
+              jitter_p99=jitter, timestamp_drift_s=drift, timing=timing, marker_bounds=marker_bounds, channels=names, bad_channels=bads,
               peak_to_peak_uv=dict(zip(names, np.ptp(data, axis=1) * 1e6)),
               std_uv=dict(zip(names, np.std(data, axis=1) * 1e6)),
               flat_step_fraction=dict(zip(names, np.mean(np.abs(np.diff(data, axis=1)) < 1e-12, axis=1))),

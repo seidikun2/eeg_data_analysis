@@ -83,7 +83,7 @@ def windows(run, cfg, params, protocol, accepted, rest_source=None):
     for trial in run.trials.itertuples():
         if not trial.valid or trial.trial not in accepted:
             continue
-        lo = int(round((trial.attention_start - run.times[0]) * sfreq))
+        lo = max(0, int(round((trial.attention_start - run.times[0]) * sfreq)))
         hi = min(run.raw.n_times, int(round((trial.pause_end - run.times[0]) * sfreq)))
         if hi - lo < n_samples:
             continue
@@ -106,7 +106,7 @@ def windows(run, cfg, params, protocol, accepted, rest_source=None):
             target = phase_target(trial.trial_class, phase, protocol, rest_source)
             if target is None:
                 continue
-            start += params["offset"]
+            start = max(start + params["offset"], run.times[0])
             end    = min(end, start + cfg["attempt_duration"] - params["offset"])
             for time in np.arange(start, end - params["window"] + 1e-8, cfg["step"]):
                 first = int(round((time - run.times[0]) * sfreq)) - lo
@@ -156,7 +156,7 @@ def phase_score(meta, predictions):
     return float(balanced_accuracy_score(phase.target, phase.pred))
 
 
-def prepare(run, cfg, protocol, accepted, rest_source=None):
+def prepare(run, cfg, protocol, accepted, rest_source=None, require_cv=False):
     datasets, errors = [], []
     cache            = {}
     for params in candidates(cfg):
@@ -167,6 +167,8 @@ def prepare(run, cfg, protocol, accepted, rest_source=None):
             X, meta = cache[key]
             if set(meta.target) != set(PROTOCOLS[protocol]):
                 raise ValueError("Classes ausentes.")
+            if require_cv:
+                trial_splits(meta, cfg["outer_folds"], cfg["seed"])
             datasets.append((params, X, meta))
         except ValueError as exc:
             errors.append(dict(params=params, error=str(exc)))
@@ -218,7 +220,7 @@ def calibrated(params, X, meta, cfg):
 
 
 def evaluate(run, cfg, protocol, accepted, training=None):
-    datasets, invalid        = prepare(run, cfg, protocol, accepted)
+    datasets, invalid        = prepare(run, cfg, protocol, accepted, require_cv=training is None)
     records, folds, searches = [], [], []
     if training is None:
         base_meta  = datasets[0][2]
@@ -228,7 +230,7 @@ def evaluate(run, cfg, protocol, accepted, training=None):
     else:
         train_run, train_accepted = training
         source                    = datasets[0][2].rest_source.iloc[0]
-        train_sets, invalid_train = prepare(train_run, cfg, protocol, train_accepted, source)
+        train_sets, invalid_train = prepare(train_run, cfg, protocol, train_accepted, source, require_cv=True)
         invalid += invalid_train
         partitions = [(set(train_sets[0][2].trial), set(datasets[0][2].trial))]
     for fold, (train_trials, test_trials) in enumerate(partitions):

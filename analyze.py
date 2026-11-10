@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 from pathlib import Path
 import traceback
+import warnings
 
 import matplotlib
 matplotlib.use("Agg")
@@ -438,6 +439,134 @@ def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocol
                 status="ok", accepted_epochs=len(epochs), classification=metrics)
 
 
+def diagnose_run(root, row, cfg, protocols=None):
+    """Pré-checagem sem treinar modelos; preserva todas as causas verificáveis por etapa."""
+    checks = []
+    result = dict(run_id=row.run_id, subject=row.subject, session=row.session,
+                  block_type=row.block_type, config=cfg, checks=checks)
+
+    def add(stage, status, message, action=""):
+        checks.append(dict(stage=stage, status=status, message=message, action=action))
+
+    for field, required in [("signal_path", {"lsl_time_s"}), ("marker_path", {"lsl_time_s", "label"})]:
+        try:
+            frame = pd.read_csv(Path(root) / row[field])
+            missing = required - set(frame)
+            if missing:
+                raise ValueError(f"Colunas ausentes: {sorted(missing)}")
+            add(field, "ok", f"{len(frame)} linhas; {len(frame.columns)} colunas.")
+            if field == "marker_path":
+                result["marker_counts"] = frame.label.value_counts().to_dict()
+        except Exception as exc:
+            add(field, "error", f"{type(exc).__name__}: {exc}", "Conferir caminho, disponibilidade e cabeçalho do CSV.")
+    run = None
+    if not any(c["status"] == "error" for c in checks):
+        try:
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always")
+                run = load_run(root, row, cfg)
+            result["qc"] = run.qc
+            add("preprocessing", "ok", f"{run.raw.n_times} amostras; {run.raw.info['sfreq']:.4f} Hz.")
+            for warning in captured:
+                add("preprocessing", "warning", str(warning.message), "Consultar qc/timing; não há deslocamento de marcadores.")
+            invalid = run.trials[~run.trials.valid]
+            if len(invalid):
+                add("trials", "warning", f"{len(invalid)} trials inválidos/excluídos: {invalid.trial.tolist()}", "Conferir sequência dos marcadores e exclusões manuais.")
+            durations = {phase: (run.trials[f"{phase}_end"] - run.trials[f"{phase}_start"]).describe().to_dict()
+                         for phase in ["attention", "attempt", "pause"]}
+            result["phase_durations"] = durations
+        except Exception as exc:
+            add("preprocessing", "error", f"{type(exc).__name__}: {exc}", "Conferir timestamps, unidades, canais e configuração; detalhes no traceback.")
+            result["traceback"] = traceback.format_exc()
+    if run is not None:
+        try:
+            _, epochs, audit = make_epochs(run, cfg)
+            result["epoch_audit"] = audit.to_dict("records")
+            result["accepted_epochs"] = len(epochs)
+            add("epochs", "ok" if len(epochs) >= 2 else "error",
+                f"{len(epochs)}/{len(audit)} épocas aceitas; rejeições: {audit.loc[~audit.accepted, 'drop_reason'].value_counts().to_dict()}",
+                "Revisar artefatos, unidades e canais; não aumentar limiar automaticamente." if len(epochs) < len(audit) else "")
+            if len(epochs):
+                valid, baseline = baseline_trials(run, epochs, cfg)
+                result["baseline_audit"] = baseline.to_dict("records")
+                action = ""
+                if not valid.any():
+                    intervals = []
+                    for trial in epochs.metadata.itertuples():
+                        previous = run.trials[run.trials.trial < trial.trial]
+                        if len(previous):
+                            intervals.append((previous.iloc[-1].pause_start - trial.attempt_start + 0.25,
+                                              trial.attention_start - trial.attempt_start - 0.25))
+                    if intervals:
+                        low = max(v[0] for v in intervals)
+                        high = min(v[1] for v in intervals)
+                        if high - low >= 0.5:
+                            suggestion = dict(baseline=[round(low, 3), round(high, 3)],
+                                              epoch_tmin=round(min(cfg["epoch_tmin"], low - 0.5), 3))
+                            result["suggested_erd_config"] = suggestion
+                            action = f"PAUSA comum com margem de 250 ms: {suggestion}. Sugestão não aplicada; revisar e reexecutar check."
+                    if not action:
+                        action = "Sem PAUSA comum suficiente: revisar protocolo ou usar baseline por trial; não substituir por ATTENTION."
+                add("erd_baseline", "ok" if valid.any() else "warning", f"{int(valid.sum())}/{len(epochs)} baselines contidas em PAUSA.", action)
+                from classify import prepare, trial_splits
+                for protocol in protocols or list(PROTOCOLS):
+                    try:
+                        datasets, rejected = prepare(run, cfg, protocol, set(epochs.metadata.trial),
+                                                     require_cv=not row.block_type.startswith("online_"))
+                        meta = datasets[0][2]
+                        if row.block_type.startswith("online_"):
+                            add(protocol, "ok", f"{len(datasets)} candidatos de teste; {meta.trial.nunique()} trials. Treino proxy verificado separadamente; modelos não ajustados.")
+                        else:
+                            outer = trial_splits(meta, cfg["outer_folds"], cfg["seed"])
+                            for train, _ in outer:
+                                trial_splits(meta.iloc[train].reset_index(drop=True), cfg["inner_folds"], cfg["seed"])
+                            add(protocol, "ok", f"{len(datasets)} candidatos; {meta.trial.nunique()} trials; {len(outer)} folds externos viáveis. Ajuste numérico dos modelos ainda não executado.")
+                        if rejected:
+                            add(protocol, "warning", f"{len(rejected)} candidatos sem suporte temporal/classes.", "Revisar duração de janela e offset.")
+                    except Exception as exc:
+                        add(protocol, "warning", f"Indisponível: {type(exc).__name__}: {exc}", "Conferir classes, duração de fases e número de trials; não usar CV por janela.")
+        except Exception as exc:
+            add("epochs", "error", f"{type(exc).__name__}: {exc}", "Conferir parâmetros de época e sequência de eventos.")
+            result["traceback"] = traceback.format_exc()
+    result["status"] = "error" if any(c["status"] == "error" for c in checks) else (
+        "warning" if any(c["status"] == "warning" for c in checks) else "ok")
+    return result
+
+
+def check_dataset(root, control, output, cfg, subjects=None, sessions=None, blocks=None, runs=None, protocols=None):
+    selected = selection(control, subjects, sessions, blocks, runs)
+    if selected.empty:
+        raise ValueError("Nenhum registro incluído corresponde aos filtros.")
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    results = []
+    for _, row in selected.iterrows():
+        print(f"Check: {row.run_id}", flush=True)
+        result = diagnose_run(root, row, cfg, protocols)
+        if row.block_type.startswith("online_"):
+            try:
+                source = calibration_row(row, selection(control))
+                result["checks"].append(dict(stage="online_training", status="ok", message=f"Calibração proxy anterior: {source.run_id}", action="Confirmar que corresponde à coleta; treino ainda não ajustado."))
+            except ValueError as exc:
+                result["checks"].append(dict(stage="online_training", status="warning", message=str(exc), action="Incluir calibração anterior na tabela ou definir train_run_id."))
+                if result["status"] == "ok":
+                    result["status"] = "warning"
+
+        folder = output / row.run_id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "diagnostics.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        results.append(result)
+        # Checkpoint por registro: diagnóstico parcial sobrevive a interrupções.
+        (output / "diagnostics.json").write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    flat = [dict(run_id=r["run_id"], **c) for r in results for c in r["checks"]]
+    pd.DataFrame(flat).to_csv(output / "diagnostics.csv", index=False)
+    page = pd.DataFrame(flat).to_html(index=False, escape=True)
+    (output / "diagnostics.html").write_text('<!doctype html><meta charset="utf-8"><title>Check EEG</title>'
+        '<style>body{font:14px system-ui;margin:24px}td{padding:10px;max-width:650px;overflow-wrap:anywhere}table{border-collapse:collapse}</style>'
+        '<h1>Diagnóstico por registro e etapa</h1><p>ok: etapa verificada; warning: limitação/ação recomendada; error: impedimento. Modelos não são treinados neste check.</p>' + page, encoding="utf-8")
+    return results
+
+
 def batch(root, control, output, cfg, subjects=None, sessions=None, blocks=None, runs=None,
           mode="both", detailed=False, protocols=None):
     selected = selection(control, subjects, sessions, blocks, runs)
@@ -447,6 +576,7 @@ def batch(root, control, output, cfg, subjects=None, sessions=None, blocks=None,
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     selected.to_csv(output / "selected_control.csv", index=False)
+    check_dataset(root, control, output, cfg, subjects, sessions, blocks, runs, protocols)
     results = []
     for _, row in selected.iterrows():
         print(f"Analisando {row.run_id}", flush=True)
@@ -454,6 +584,9 @@ def batch(root, control, output, cfg, subjects=None, sessions=None, blocks=None,
             results.append(analyze_run(root, row, cfg, output / row.run_id, mode, detailed, protocols, included))
         except Exception as exc:
             traceback.print_exc()
+            folder = output / row.run_id
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "error_traceback.txt").write_text(traceback.format_exc(), encoding="utf-8")
             results.append(dict(run_id=row.run_id, subject=row.subject, session=row.session,
                                 block_type=row.block_type, status=f"{type(exc).__name__}: {exc}"))
         finally:
@@ -466,18 +599,18 @@ def batch(root, control, output, cfg, subjects=None, sessions=None, blocks=None,
     for row in results:
         rid     = html.escape(row["run_id"], quote=True)
         status  = html.escape(row["status"])
-        content = f'<a href="{rid}/report.html">Relatório detalhado</a><img src="{rid}/dashboard.png" alt="Dashboard">' if row["status"] == "ok" else ""
+        content = f'<a href="{rid}/report.html">Relatório detalhado</a><img src="{rid}/dashboard.png" alt="Dashboard">' if row["status"] == "ok" else f'<a href="{rid}/diagnostics.json">Diagnóstico</a> · <a href="{rid}/error_traceback.txt">Erro completo</a>'
         cards.append(f"<article><h2>{rid}</h2><p>{status}</p>{content}</article>")
     (output / "index.html").write_text('<!doctype html><html lang="pt-BR"><meta charset="utf-8">'
         '<title>EEG · análise batch</title><style>body{font:16px system-ui;max-width:1500px;margin:32px auto;padding:20px;background:#f6f6f6}article{background:white;padding:24px;margin:24px 0}img{width:100%;height:auto}h2{overflow-wrap:anywhere}</style>'
-        '<h1>EEG · análise batch</h1><p>Resultados descritivos offline. Consulte parâmetros, rejeições e validação em cada relatório.</p>'
+        '<h1>EEG · análise batch</h1><p><a href="diagnostics.html">Check de todos os registros</a></p><p>Resultados descritivos offline. Consulte parâmetros, rejeições e validação em cada relatório.</p>'
         + "".join(cards) + "</html>")
     return results
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["index", "batch", "report"])
+    parser.add_argument("command", choices=["index", "check", "batch", "report"])
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--control", type=Path)
     parser.add_argument("--output", type=Path, default=Path("analysis_outputs"))
@@ -496,6 +629,11 @@ def main():
     else:
         # Subdiretório único evita confundir arquivos de execuções com parâmetros diferentes.
         output  = args.output / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        if args.command == "check":
+            results = check_dataset(args.root, control, output, settings(args.config), args.subjects, args.sessions,
+                                    args.blocks, args.runs, args.protocols)
+            print(f"Diagnóstico: {output.resolve()}")
+            raise SystemExit(int(any(r["status"] == "error" for r in results)))
         results = batch(args.root, control, output, settings(args.config), args.subjects, args.sessions,
                         args.blocks, args.runs, args.mode, args.command == "report", args.protocols)
         print(f"Relatórios: {output.resolve()}")

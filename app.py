@@ -74,6 +74,14 @@ with tab_analysis:
         st.write(f"{len(chosen)} registros selecionados.")
         if not chosen.empty:
             st.dataframe(chosen[["run_id", "subject", "session", "block_type"]], hide_index=True)
+        if st.button("Verificar dados antes da análise", disabled=chosen.empty):
+            from analyze import check_dataset
+            output = Path(out_text).expanduser().resolve() / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+            with st.spinner("Verificando arquivos, relógio, marcadores, épocas e viabilidade dos protocolos..."):
+                diagnostics = check_dataset(root, control, output, cfg, subjects, sessions, blocks, runs, protocols)
+            st.write(f"Diagnóstico salvo em {output}")
+            st.dataframe(pd.DataFrame([dict(run_id=r["run_id"], **c) for r in diagnostics for c in r["checks"]]), hide_index=True)
+            st.download_button("Baixar diagnóstico JSON", (output / "diagnostics.json").read_bytes(), "diagnostics.json", "application/json")
         if st.button("Gerar relatórios", type="primary", disabled=chosen.empty or (mode != "ephys" and not protocols)):
             from analyze import batch
             output = Path(out_text).expanduser().resolve() / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
@@ -86,12 +94,17 @@ with tab_analysis:
         st.error(str(exc))
 with tab_results:
     output_root = Path(out_text).expanduser()
-    choices     = sorted([p.parent for p in output_root.glob("*/batch_results.json")], reverse=True) if output_root.exists() else []
+    choices     = sorted({p.parent for pattern in ["*/batch_results.json", "*/diagnostics.json"] for p in output_root.glob(pattern)}, reverse=True) if output_root.exists() else []
     if not choices:
         st.info("Gere um relatório para consultar os resultados aqui.")
     else:
         output  = st.selectbox("Execução", choices, format_func=lambda p: p.name)
-        results = json.loads((output / "batch_results.json").read_text())
+        if (output / "diagnostics.json").exists():
+            diagnostic_rows = json.loads((output / "diagnostics.json").read_text())
+            with st.expander("Diagnóstico por registro e etapa", expanded=True):
+                st.dataframe(pd.DataFrame([dict(run_id=r["run_id"], **c) for r in diagnostic_rows for c in r["checks"]]), hide_index=True)
+                st.download_button("Baixar diagnóstico completo", (output / "diagnostics.json").read_bytes(), "diagnostics.json", "application/json", key="saved_diagnostics")
+        results = json.loads((output / "batch_results.json").read_text()) if (output / "batch_results.json").exists() else []
         visible = [r for r in results if (not subjects or r["subject"] in subjects)
                    and (not sessions or r["session"] in sessions) and (not blocks or r["block_type"] in blocks)
                    and (not runs or r["run_id"] in runs)]

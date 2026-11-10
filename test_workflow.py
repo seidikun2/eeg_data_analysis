@@ -190,3 +190,49 @@ def test_clock_chunks_and_small_reversal(chunks):
     assert np.all(np.diff(corrected) > 0)
     assert qc["sfreq"] == pytest.approx(128, rel=0.001)
     assert qc["max_correction_s"] < 0.1
+
+
+def test_marker_edges_do_not_discard_recording(tmp_path):
+    control = synthetic(tmp_path, n=8)
+    row = selection(control).iloc[0]
+    path = tmp_path / row.marker_path
+    frame = pd.read_csv(path)
+    frame.loc[frame.index[frame.label == 'ATTENTION'][0], 'lsl_time_s'] = 999.995
+    extra = pd.DataFrame({'label': ['BASELINE', 'BLOCK_END'], 'lsl_time_s': [999.99, 1100.01]})
+    pd.concat([extra, frame]).to_csv(path, index=False)
+    with pytest.warns(RuntimeWarning, match='bordas'):
+        run = load_run(tmp_path, row, quick_config())
+    assert run.qc['marker_bounds']['outside_count'] == 3
+    assert run.trials.valid.all()
+    assert len(make_epochs(run, quick_config())[1]) == 8
+
+
+def test_check_collects_errors_from_both_files(tmp_path):
+    from analyze import check_dataset
+    control = synthetic(tmp_path, n=4)
+    row = selection(control).iloc[0]
+    (tmp_path / row.signal_path).unlink()
+    pd.DataFrame({'wrong_column': [1]}).to_csv(tmp_path / row.marker_path, index=False)
+    output = tmp_path / 'diagnostics'
+    results = check_dataset(tmp_path, control, output, quick_config())
+    assert results[0]['status'] == 'error'
+    assert {c['stage'] for c in results[0]['checks'] if c['status'] == 'error'} == {'signal_path', 'marker_path'}
+    for name in ['diagnostics.json', 'diagnostics.csv', 'diagnostics.html']:
+        assert (output / name).exists()
+
+
+def test_infeasible_long_window_does_not_poison_short_candidate(tmp_path):
+    control = synthetic(tmp_path, n=16)
+    row = selection(control).iloc[0]
+    path = tmp_path / row.marker_path
+    markers = pd.read_csv(path)
+    markers.loc[markers.index[markers.label == 'ATTENTION'][0], 'lsl_time_s'] = 1002.5
+    markers.to_csv(path, index=False)
+    cfg = quick_config()
+    cfg.update(windows=[1.0, 1.5], offsets=[0.0], search_budget=2)
+    run = load_run(tmp_path, row, cfg)
+    _, epochs, _ = make_epochs(run, cfg)
+    data, errors = prepare(run, cfg, 'attention_move', set(epochs.metadata.trial), require_cv=True)
+    assert len(data) == 1 and len(errors) == 1
+    assert data[0][0]['window'] == 1.0
+    assert data[0][2].trial.nunique() == 16
