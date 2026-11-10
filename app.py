@@ -64,10 +64,25 @@ with tab_analysis:
     st.write("Os filtros da barra lateral são aplicados aos registros incluídos na tabela salva.")
     mode      = st.selectbox("Análises", ["both", "ephys", "classification"],
                         format_func=lambda s: {"both": "Eletrofisiologia + classificação", "ephys": "Eletrofisiologia", "classification": "Classificação"}[s])
-    detailed  = st.checkbox("Relatório minucioso: cada época antes/depois", value=True)
+    detailed  = st.checkbox("Relatório minucioso: cada época antes/depois", value=True, help="Mais demorado. Para batch comparativo, desmarque se não precisar inspecionar cada época.")
     protocols = st.multiselect("Protocolos", list(PROTOCOLS), default=["left_right"])
+    compare = st.checkbox("Batch comparativo: avaliar TGSP e CSP separadamente", value=False,
+                          help="Produz comparison.html e tabelas por sujeito; busca aninhada em cada pipeline. Mais demorado.")
     try:
         cfg = settings(cfg_text or None)
+        with st.expander("Ajustar experimento e visualização"):
+            cfg["windows"] = st.multiselect("Janelas (s)", sorted(set([.5, 1., 1.5, 2., 2.5, 3.] + cfg["windows"])), default=cfg["windows"])
+            cfg["offsets"] = st.multiselect("Offsets de treino (s)", sorted(set([0., .25, .5, 1.] + cfg["offsets"])), default=cfg["offsets"])
+            bank_options = {json.dumps(v): v for v in ([[[8,30]], [[5,35]], [[8,13],[13,30]]] + cfg["bands"])}
+            banks = st.multiselect("Bandas / bancos a testar", list(bank_options), default=[json.dumps(v) for v in cfg["bands"]])
+            cfg["bands"] = [bank_options[v] for v in banks]
+            cfg["svm_c"] = st.multiselect("SVM · valores de C", sorted(set([.01,.1,1.,10.,100.] + cfg["svm_c"])), default=cfg["svm_c"])
+            cfg["search_budget"] = st.number_input("Máximo de candidatos por busca interna", 1, 200, int(cfg["search_budget"]))
+            cfg["curve_smoothing_s"] = st.slider("Suavização visual causal (s)", .1, 2., float(cfg["curve_smoothing_s"]), .1)
+            cfg["erd_baseline_mode"] = st.selectbox("Baseline ERD/ERS", ["preceding_pause", "fixed"], index=0 if cfg["erd_baseline_mode"] == "preceding_pause" else 1,
+                                                     format_func=lambda v: "PAUSA anterior por trial (auditada)" if v == "preceding_pause" else "Intervalo fixo do JSON")
+        if not cfg["windows"] or not cfg["offsets"] or not cfg["bands"] or not cfg["svm_c"]:
+            raise ValueError("Selecione ao menos uma janela, offset, banco de bandas e valor de C.")
         with st.expander("Parâmetros efetivos"):
             st.json(cfg)
         chosen = selection(control, subjects, sessions, blocks, runs)
@@ -86,7 +101,7 @@ with tab_analysis:
             from analyze import batch
             output = Path(out_text).expanduser().resolve() / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
             with st.spinner("Processando. Busca aninhada pode demorar; resultados serão gravados por registro."):
-                results = batch(root, control, output, cfg, subjects, sessions, blocks, runs, mode, detailed, protocols)
+                results = batch(root, control, output, cfg, subjects, sessions, blocks, runs, mode, detailed, protocols, compare)
             st.session_state["last_output"] = str(output)
             st.success(f"Execução concluída: {output}")
             st.json(results)
@@ -114,6 +129,9 @@ with tab_results:
                     st.error(result["status"])
                     continue
                 folder = output / result["run_id"]
+                if (output / "comparison.html").exists():
+                    st.download_button("Baixar comparação do batch", (output / "comparison.html").read_bytes(), "comparison.html", "text/html", key=f"compare_{result['run_id']}")
+                st.caption("Baixe e abra o HTML no navegador para zoom, inspeção do raw e traçados contínuos. As imagens abaixo são resumos estáticos.")
                 st.image(str(folder / "dashboard.png"))
                 st.download_button("Baixar relatório HTML completo", (folder / "report.html").read_bytes(),
                                    file_name=f"{result['run_id']}.html", mime="text/html", key=result["run_id"])

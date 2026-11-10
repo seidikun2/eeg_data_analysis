@@ -246,3 +246,65 @@ def test_legacy_mne_montage_name(tmp_path, monkeypatch):
     assert run.qc['montage'] == 'standard_1020'
     assert all(channel['loc'][:3].any() for channel in run.raw.info['chs'])
     assert len(make_epochs(run, quick_config())[1]) == 4
+
+
+def test_comparison_timeline_and_causal_smoothing(tmp_path):
+    from analyze import batch
+    from reporting import smoothed_timeline
+    control = synthetic(tmp_path, n=16)
+    cfg = quick_config()
+    output = tmp_path / 'comparison'
+    results = batch(tmp_path, control, output, cfg, mode='classification', protocols=['left_right'], compare=True)
+    assert results[0]['status'] == 'ok'
+    assert {m['pipeline'] for m in results[0]['classification'] if m['status']=='ok'} == {'tgsp','csp'}
+    assert (output / 'comparison.html').exists()
+    scores = pd.read_csv(output / 'comparison_subjects.csv')
+    assert len(scores) == 2 and scores.n_runs.eq(1).all()
+    paired = pd.read_csv(output / 'pipeline_paired_differences.csv')
+    assert len(paired) == 1
+    folder = output / results[0]['run_id']
+    timeline = pd.read_csv(folder / 'tgsp_left_right_timeline.csv')
+    evaluation = pd.read_csv(folder / 'tgsp_left_right_predictions.csv')
+    assert timeline.groupby('trial').fold.nunique().eq(1).all()
+    assert timeline.groupby('trial').fold.first().equals(evaluation.groupby('trial').fold.first())
+    assert set(timeline.phase) >= {'STIMULUS','ATTEMPT','PAUSE'}
+    assert np.allclose(timeline[['p_LEFT','p_RIGHT']].sum(axis=1),1)
+    smooth = smoothed_timeline(timeline, .6)
+    changed = timeline.copy()
+    last = changed.index[-1]
+    changed.loc[last,'p_LEFT'] = .123
+    again = smoothed_timeline(changed,.6)
+    assert np.allclose(smooth.p_LEFT.iloc[:-1],again.p_LEFT.iloc[:-1])
+    page = (folder/'report.html').read_text()
+    assert 'plotly' in page.lower() and 'Raw antes/depois · zoom por canal' not in page  # modo classificação
+    assert 'viewport' in page and 'Classificador' in page
+
+
+def test_context_trials_not_used_for_training_or_metrics(tmp_path):
+    control = synthetic(tmp_path, n=24, classes=('LEFT','RIGHT','REST_STIM'))
+    cfg = quick_config()
+    run = load_run(tmp_path, selection(control).iloc[0], cfg)
+    _, epochs, _ = make_epochs(run,cfg)
+    summary, evaluation, _ = evaluate(run,cfg,'left_right',set(epochs.metadata.trial))
+    context = pd.DataFrame(summary['_timeline'])
+    assert context.trial.nunique() == 24
+    assert evaluation.trial.nunique() == 16
+    assert set(context.loc[context.context_only,'trial_class']) == {'REST_STIM'}
+    assert context.groupby('trial').fold.nunique().eq(1).all()
+    for fold in summary['folds']:
+        assert not set(context.loc[context.fold==fold['fold'],'trial']) & set(fold['train_trials'])
+
+
+def test_batch_comparison_aggregates_subjects_not_runs(tmp_path):
+    from reporting import batch_comparison
+    records=[]
+    for subject in ['AB01','AB02']:
+        for index, score in enumerate([.4,.8]):
+            records.append(dict(run_id=f'{subject}_{index}',subject=subject,session='S1',block_type='IM_treino',
+                                classification=[dict(protocol='left_right',pipeline='tgsp',validation='nested_trial_cv',
+                                                     balanced_accuracy=score,chance=.5,status='ok')]))
+    batch_comparison(tmp_path,records)
+    frame=pd.read_csv(tmp_path/'comparison_subjects.csv')
+    assert len(frame)==2
+    assert frame.n_runs.eq(2).all()
+    assert np.allclose(frame.balanced_accuracy,.6)

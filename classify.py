@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from itertools import product
 import json
+from pathlib import Path
 
 import mne
 import numpy as np
@@ -72,6 +73,41 @@ def phase_target(cls, phase, protocol, rest_source):
     raise ValueError(protocol)
 
 
+def trial_signal(run, trial, cfg, params, picks):
+    sfreq = run.raw.info["sfreq"]
+    lo = max(0, int(round((trial.attention_start - run.times[0]) * sfreq)))
+    hi = min(run.raw.n_times, int(round((trial.pause_end - run.times[0]) * sfreq)))
+    segment = run.raw.get_data(picks=picks, start=lo, stop=hi)
+    for frequency in cfg["notch"]:
+        if frequency < sfreq / 2:
+            segment = mne.filter.notch_filter(segment, sfreq, [frequency], method="iir", phase="forward", verbose=False)
+    if cfg["reference"] == "average":
+        segment = segment - segment.mean(axis=0, keepdims=True)
+    filtered = np.stack([mne.filter.filter_data(segment, sfreq, low, high, method="iir", phase="forward",
+                         iir_params=dict(order=4, ftype="butter"), verbose=False) for low, high in params["bands"]])
+    return filtered, lo, hi
+
+
+def continuous_windows(run, cfg, params, trials):
+    sfreq = run.raw.info["sfreq"]
+    picks = mne.pick_types(run.raw.info, eeg=True, exclude="bads")
+    size  = int(round(params["window"] * sfreq))
+    data, rows = [], []
+    for trial in run.trials.itertuples():
+        if not trial.valid or trial.trial not in trials:
+            continue
+        signal, lo, hi = trial_signal(run, trial, cfg, params, picks)
+        for first in range(0, hi - lo - size + 1, max(1, round(cfg["step"] * sfreq))):
+            end = run.times[0] + (lo + first + size) / sfreq
+            phase = "ATTENTION" if end < trial.stimulus_start else ("STIMULUS" if end < trial.attempt_start else ("ATTEMPT" if end < trial.pause_start else "PAUSE"))
+            data.append(signal[:, :, first:first + size])
+            rows.append(dict(trial=trial.trial, trial_class=trial.trial_class, phase=phase,
+                             start_abs=end, time_end=end - trial.attempt_start))
+    if not rows:
+        return None, pd.DataFrame()
+    return np.array(data), pd.DataFrame(rows)
+
+
 def windows(run, cfg, params, protocol, accepted, rest_source=None):
     sfreq = run.clean.info["sfreq"]
     picks = mne.pick_types(run.clean.info, eeg=True, exclude="bads")
@@ -83,22 +119,9 @@ def windows(run, cfg, params, protocol, accepted, rest_source=None):
     for trial in run.trials.itertuples():
         if not trial.valid or trial.trial not in accepted:
             continue
-        lo = max(0, int(round((trial.attention_start - run.times[0]) * sfreq)))
-        hi = min(run.raw.n_times, int(round((trial.pause_end - run.times[0]) * sfreq)))
+        filtered, lo, hi = trial_signal(run, trial, cfg, params, picks)
         if hi - lo < n_samples:
             continue
-        # Cada trial é filtrado isoladamente: não há mistura temporal entre folds.
-        segment = run.raw.get_data(picks=picks, start=lo, stop=hi)
-        for frequency in cfg["notch"]:
-            if frequency < sfreq / 2:
-                segment = mne.filter.notch_filter(segment, sfreq, [frequency], method="iir",
-                                                  phase="forward", verbose=False)
-        if cfg["reference"] == "average":
-            segment = segment - segment.mean(axis=0, keepdims=True)
-        filtered = np.stack([mne.filter.filter_data(
-            segment, sfreq, low, high, method="iir", phase="forward",
-            iir_params=dict(order=4, ftype="butter"), verbose=False,
-        ) for low, high in params["bands"]])
         phases   = [("ATTENTION", trial.attention_start, trial.attention_end),
                   ("ATTEMPT", trial.attempt_start, trial.attempt_end),
                   ("PAUSE", trial.pause_start, trial.pause_end)]
@@ -221,7 +244,7 @@ def calibrated(params, X, meta, cfg):
 
 def evaluate(run, cfg, protocol, accepted, training=None):
     datasets, invalid        = prepare(run, cfg, protocol, accepted, require_cv=training is None)
-    records, folds, searches = [], [], []
+    records, folds, searches, timelines = [], [], [], []
     if training is None:
         base_meta  = datasets[0][2]
         splits     = trial_splits(base_meta, cfg["outer_folds"], cfg["seed"])
@@ -233,6 +256,8 @@ def evaluate(run, cfg, protocol, accepted, training=None):
         train_sets, invalid_train = prepare(train_run, cfg, protocol, train_accepted, source, require_cv=True)
         invalid += invalid_train
         partitions = [(set(train_sets[0][2].trial), set(datasets[0][2].trial))]
+    evaluated_trials = set(datasets[0][2].trial)
+    extra_context = sorted(set(accepted) - evaluated_trials)
     for fold, (train_trials, test_trials) in enumerate(partitions):
         index, search    = choose(train_sets, train_trials, cfg)
         params, Xtr, mtr = train_sets[index]
@@ -252,6 +277,16 @@ def evaluate(run, cfg, protocol, accepted, training=None):
         for j, cls in enumerate(model.classes_):
             frame[f"p_{cls}"] = proba[:, j]
         records.append(frame)
+        context_trials = set(test_trials) | {trial for i, trial in enumerate(extra_context) if i % len(partitions) == fold}
+        context, context_meta = continuous_windows(run, cfg, params, context_trials)
+        if context is not None:
+            context_meta["context_only"] = ~context_meta.trial.isin(test_trials)
+            context_proba = model.predict_proba(context)
+            context_meta["fold"] = fold
+            for j, cls in enumerate(model.classes_):
+                context_meta[f"p_{cls}"] = context_proba[:, j]
+            timelines.append(context_meta)
+
         pcols      = [f"p_{cls}" for cls in model.classes_]
         phase      = frame.groupby(["trial", "target"], as_index=False)[pcols].mean()
         phase_pred = model.classes_[phase[pcols].to_numpy().argmax(axis=1)]
@@ -272,15 +307,21 @@ def evaluate(run, cfg, protocol, accepted, training=None):
         rest_source=predictions.rest_source.iloc[0], folds=folds, search=searches,
         invalid_candidates=invalid,
         validation="nested_trial_cv" if training is None else "prior_calibration_proxy",
-        curve_time="fim da janela causal; sem suavização/interpolação entre fases",
+        curve_time="fim da janela causal; timeline inferida somente em trials de teste; suavização apenas visual",
+        _timeline=pd.concat(timelines, ignore_index=True).to_dict("records") if timelines else [],
         preprocessing="causal Butterworth ordem 4 por trial; referência conforme config; canais ruins excluídos",
     )
     return summary, predictions, phase
 
 
-def save_result(result, directory):
+def save_result(result, directory, prefix=""):
+    directory = Path(directory)
     summary, predictions, phase = result
-    name                        = summary["protocol"]
+    name                        = prefix + summary["protocol"]
+    summary                     = summary.copy()
+    timeline                    = summary.pop("_timeline", [])
+    if timeline:
+        pd.DataFrame(timeline).to_csv(directory / f"{name}_timeline.csv", index=False)
     (directory / f"{name}.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     predictions.to_csv(directory / f"{name}_predictions.csv", index=False)
     phase.to_csv(directory / f"{name}_trial_scores.csv", index=False)

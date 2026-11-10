@@ -1,5 +1,5 @@
 {
-  "scale_to_volts": 0.000001,
+  "scale_to_volts": 1e-06,
   "l_freq": 0.5,
   "h_freq": 45.0,
   "notch": [],
@@ -28,5 +28,8 @@
   "inner_folds": 3,
   "search_budget": 12,
   "seed": 42,
-  "dpi": 300
+  "dpi": 300,
+  "curve_smoothing_s": 0.6,
+  "erd_baseline_mode": "preceding_pause",
+  "comparison_pipelines": ["tgsp", "csp"]
 }

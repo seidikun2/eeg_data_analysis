@@ -48,6 +48,10 @@ def settings(path=None):
             raise ValueError(f"{name} precisa estar dentro da época.")
     if base["step"] <= 0 or min(base["windows"]) <= 0 or min(base["offsets"]) < 0:
         raise ValueError("Janelas/passo positivos; offsets não negativos.")
+    if base["erd_baseline_mode"] not in {"preceding_pause", "fixed"}:
+        raise ValueError("erd_baseline_mode deve ser preceding_pause ou fixed.")
+    if base["curve_smoothing_s"] <= 0:
+        raise ValueError("curve_smoothing_s deve ser positivo.")
     return base
 
 

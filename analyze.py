@@ -23,6 +23,7 @@ from scipy.signal import spectrogram
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
+from reporting import Report, overlay_plot, timeline_plot, batch_comparison, smoothed_timeline, class_trials, mean_curve
 from eeg import COLORS, PROTOCOLS, fingerprint, load_run, make_epochs, scan, selection, settings
 
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 9, "axes.spines.top": False,
@@ -34,11 +35,15 @@ def save_figure(fig, directory, name, cfg, report=None, title=None):
     fig.savefig(directory / f"{name}.png", dpi=cfg["dpi"])
     fig.savefig(directory / f"{name}.pdf")
     if report is not None:
-        report.add_figure(fig, title=title or name, image_format="png")
+        labels = {"raw_antes_depois": "Raw · antes/depois sobrepostos", "sanity_checks": "Sanity checks · amplitude, ruído e rejeição",
+                  "epocas_canais": "Épocas · mapa por canal", "pca_2d_3d": "PCA · 2D e 3D", "dashboard": "Dashboard · visão geral",
+                  "tempo_frequencia": "Tempo–frequência · visão global", "topografias_mu_beta": "Topografias · mu e beta", "espectrograma": "Espectrograma · canais centrais"}
+        report.add_figure(fig, title=title or labels.get(name, name.replace("_", " · ")), image_format="png")
     plt.close(fig)
 
 
 def stacked(ax, data, times, names, scale, title):
+    data   = data - np.median(data, axis=-1, keepdims=True)
     offset = np.arange(len(names))[::-1] * scale
     for i in range(len(names)):
         ax.plot(times, data[i] * 1e6 + offset[i], color="0.25", lw=0.45)
@@ -46,29 +51,166 @@ def stacked(ax, data, times, names, scale, title):
     ax.text(1, 1.02, f"espaçamento: {scale:.0f} µV", transform=ax.transAxes, ha="right", fontsize=8)
 
 
+def raw_snapshot(run):
+    sfreq = run.raw.info["sfreq"]
+    width = min(run.raw.n_times, int(12 * sfreq))
+    first = max(0, (run.raw.n_times - width) // 2)
+    picks = mne.pick_types(run.raw.info, eeg=True, exclude="bads")
+    return (run.raw.get_data(picks=picks, start=first, stop=first + width),
+            run.clean.get_data(picks=picks, start=first, stop=first + width),
+            run.raw.times[first:first + width], [run.raw.ch_names[i] for i in picks])
+
+
 def raw_figure(run, cfg):
-    stop      = min(run.raw.n_times, int(20 * run.raw.info["sfreq"]))
-    picks     = mne.pick_types(run.clean.info, eeg=True, exclude="bads")
-    names     = [run.raw.ch_names[i] for i in picks]
-    data      = run.raw.get_data(picks=picks, stop=stop)
-    scale     = max(20, float(np.quantile(np.ptp(data, axis=1) * 1e6, 0.8)))
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True, layout="constrained")
-    for ax, raw, label in zip(axes, [run.raw, run.clean], ["Antes", "Depois"]):
-        stacked(ax, raw.get_data(picks=picks, stop=stop), raw.times[:stop], names, scale, label)
+    before, after, times, names = raw_snapshot(run)
+    before                      = (before - np.median(before, axis=1, keepdims=True)) * 1e6
+    after                       = (after - np.median(after, axis=1, keepdims=True)) * 1e6
+    fig, axes                   = plt.subplots(len(names), 1, figsize=(13, max(8, len(names) * .75)), sharex=True, layout="constrained")
+    for i, ax in enumerate(np.atleast_1d(axes)):
+        ax.plot(times, before[i], color="0.5", lw=.6, label="Antes")
+        ax.plot(times, after[i], color="#0072B2", lw=.7, label="Depois")
+        limit = max(5, float(np.quantile(np.abs(np.r_[before[i], after[i]]), .995)) * 1.15)
+        ax.set(ylim=(-limit, limit), ylabel=f"{names[i]}\nµV")
+    np.atleast_1d(axes)[0].legend(ncol=2)
+    np.atleast_1d(axes)[-1].set_xlabel("Tempo desde início do sinal (s)")
+    fig.suptitle("Snapshot central · antes/depois sobrepostos · mediana removida só para exibição")
     return fig
 
 
+def central_picks(info):
+    return [i for i, name in enumerate(info["ch_names"]) if name in {"C3", "Cz", "C4"} and name not in info["bads"]]
+
+
 def erp_plot(ax, epochs, cfg):
-    times = epochs.times
+    picks = central_picks(epochs.info)
     for cls in epochs.event_id:
-        values = epochs[cls].get_data(picks=mne.pick_types(epochs.info, eeg=True, exclude="bads")) * 1e6
-        values = values - values[:, :, (times >= cfg["baseline"][0]) & (times <= cfg["baseline"][1])].mean(axis=-1, keepdims=True)
-        mean   = values.mean(axis=0)
-        ax.plot(times, mean.T, color=COLORS[cls], alpha=0.35, lw=0.6)
-        ax.plot([], [], color=COLORS[cls], label=f"{cls} · n={len(values)}")
-    ax.axvline(0, color="0.3", ls="--", lw=0.8)
-    ax.set(title="ERP: todos os canais, uma cor por classe", xlabel="Tempo desde ATTEMPT (s)", ylabel="µV")
+        values = epochs[cls].get_data(picks=picks or mne.pick_types(epochs.info, eeg=True, exclude="bads")) * 1e6
+        values -= values[:, :, (epochs.times >= cfg["baseline"][0]) & (epochs.times <= cfg["baseline"][1])].mean(axis=-1, keepdims=True)
+        trials = values.mean(axis=1)
+        ax.plot(epochs.times, trials.mean(axis=0), color=COLORS[cls], lw=1.5, label=cls)
+    ax.axvline(0, color="0.3", ls="--", lw=.8)
+    ax.set(title="ERP · média C3/Cz/C4 · detalhes por canal no relatório", xlabel="Tempo desde ATTEMPT (s)", ylabel="µV")
     ax.legend(fontsize=7)
+
+
+def erp_figures(epochs, cfg):
+    picks = mne.pick_types(epochs.info, eeg=True, exclude="bads")
+    for cls in epochs.event_id:
+        values = epochs[cls].get_data(picks=picks) * 1e6
+        values -= values[:, :, (epochs.times >= cfg["baseline"][0]) & (epochs.times <= cfg["baseline"][1])].mean(axis=-1, keepdims=True)
+        fig, axes = plt.subplots(int(np.ceil(len(picks) / 3)), 3, figsize=(14, 3 * np.ceil(len(picks) / 3)), sharex=True, layout="constrained")
+        for i, ax in enumerate(axes.ravel()):
+            if i >= len(picks):
+                ax.axis("off")
+                continue
+            mean, sd = values[:, i].mean(axis=0), values[:, i].std(axis=0)
+            ax.fill_between(epochs.times, mean - sd, mean + sd, color=COLORS[cls], alpha=.18, label="±1 DP entre trials")
+            ax.plot(epochs.times, mean, color=COLORS[cls], lw=1.5, label="Média dos trials")
+            ax.axvline(0, color="0.4", lw=.7, ls="--")
+            ax.set(title=epochs.ch_names[picks[i]], xlabel="Tempo (s)", ylabel="µV")
+        axes.ravel()[0].legend(fontsize=7)
+        fig.suptitle(f"ERP · {cls} · n={len(values)} trials · média ± DP; escalas por canal")
+        yield f"erp_{cls}", fig
+
+
+def quality_checks(run, audit, cfg):
+    from scipy.signal import welch
+    before    = run.raw.get_data() * 1e6
+    after     = run.clean.get_data() * 1e6
+    std       = after.std(axis=1)
+    ratio     = std / max(np.median(std), 1e-12)
+    freq, psd = welch(before, fs=run.raw.info['sfreq'], nperseg=min(before.shape[-1], int(4 * run.raw.info['sfreq'])), axis=-1)
+    total     = psd[:, (freq >= 1) & (freq < min(100, run.raw.info['sfreq'] / 2))].sum(axis=1)
+    line      = psd[:, ((abs(freq - 50) <= 1) | (abs(freq - 60) <= 1))].sum(axis=1) / np.maximum(total, 1e-20) * 100
+    rejected  = [sum(name in str(reason).split(';') for reason in audit.drop_reason) for name in run.raw.ch_names]
+    frame     = pd.DataFrame(dict(channel=run.raw.ch_names, raw_dc_uv=np.median(before, axis=1),
+                              raw_std_uv=before.std(axis=1), clean_std_uv=std, relative_std=ratio,
+                              raw_peak_to_peak_uv=np.ptp(before, axis=1), clean_peak_to_peak_uv=np.ptp(after, axis=1),
+                              line_noise_percent=line, rejected_epochs=rejected,
+                              excluded=[c in run.raw.info['bads'] for c in run.raw.ch_names],
+                              flag=['variação baixa' if v < .2 else ('variação alta' if v > 5 else 'sem alerta relativo') for v in ratio]))
+    fig, axes = plt.subplots(3, 1, figsize=(13, 10), layout='constrained')
+    x         = np.arange(len(frame))
+    axes[0].bar(x - .18, frame.raw_std_uv, .36, color='0.6', label='Antes')
+    axes[0].bar(x + .18, frame.clean_std_uv, .36, color='#0072B2', label='Depois')
+    axes[0].set(yscale='log', ylabel='Desvio-padrão (µV)', title='Variação por canal · escala logarítmica; offsets DC na tabela')
+    axes[0].legend()
+    axes[1].bar(x, line, color='0.45')
+    axes[1].set(ylabel='% da potência 1–100 Hz', title='Ruído estreito em 50/60 Hz ±1 Hz · sinal antes do filtro')
+    axes[2].bar(x, rejected, color='0.45')
+    axes[2].set(ylabel='Épocas rejeitadas', title=f'{int((~audit.accepted).sum())}/{len(audit)} épocas rejeitadas · contribuição por canal (pode haver múltiplas causas)')
+    for ax in axes:
+        ax.set_xticks(x, frame.channel, rotation=30, ha='right')
+    return frame, fig
+
+
+def central_spectrogram(run, cfg):
+    picks = central_picks(run.clean.info)
+    if not picks:
+        picks = mne.pick_types(run.clean.info, eeg=True, exclude='bads')[:3].tolist()
+    data             = run.clean.get_data(picks=picks)
+    freq, time, spec = spectrogram(data, fs=run.clean.info['sfreq'], nperseg=min(data.shape[-1], round(2 * run.clean.info['sfreq'])),
+                                    noverlap=round(run.clean.info['sfreq'] * 1.5), axis=-1)
+    keep             = (freq >= 1) & (freq <= cfg['h_freq'])
+    values           = 10 * np.log10(np.maximum(spec[:, keep] * 1e12, 1e-20))
+    low, high        = np.quantile(values, [.02, .98])
+    fig, axes        = plt.subplots(len(picks), 1, figsize=(13, 3.3 * len(picks)), sharex=True, layout='constrained', squeeze=False)
+    for i, ax in enumerate(axes[:, 0]):
+        im = ax.pcolormesh(time, freq[keep], values[i], cmap='cividis', vmin=low, vmax=high, shading='auto')
+        ax.set(title=run.clean.ch_names[picks[i]], ylabel='Hz')
+    axes[-1, 0].set_xlabel('Tempo desde início do EEG (s)')
+    fig.colorbar(im, ax=list(axes[:, 0]), label='dB (µV²/Hz) · escala comum')
+    fig.suptitle('Espectrograma contínuo · canais centrais')
+    return fig
+
+
+def central_erd_figures(power, cfg):
+    if power is None:
+        return
+    picks = central_picks(power.info)
+    if not picks:
+        return
+    for cls in power.event_id:
+        data      = power[cls].data
+        fig, axes = plt.subplots(2, len(picks), figsize=(5 * len(picks), 7), sharex=True, layout='constrained', squeeze=False)
+        for row, band in enumerate(['mu', 'beta']):
+            keep = (power.freqs >= cfg[band][0]) & (power.freqs < cfg[band][1])
+            for col, ch in enumerate(picks):
+                traces   = data[:, ch, keep].mean(axis=1) * 100
+                mean, sd = traces.mean(axis=0), traces.std(axis=0)
+                ax       = axes[row, col]
+                ax.fill_between(power.times, mean - sd, mean + sd, color=COLORS[cls], alpha=.18)
+                ax.plot(power.times, mean, color=COLORS[cls], lw=1.8)
+                ax.axhline(0, color='0.5', lw=.7)
+                ax.axvline(0, color='0.4', ls='--', lw=.7)
+                ax.set(title=f'{power.ch_names[ch]} · {band}', xlabel='Tempo desde ATTEMPT (s)', ylabel='Δ potência (%)')
+        fig.suptitle(f'ERD/ERS · {cls} · média ± DP entre trials; negativo: ERD')
+        yield f'erd_central_{cls}', fig
+        fig, axes = plt.subplots(len(picks), 1, figsize=(13, len(picks) * 3.2), sharex=True, layout='constrained', squeeze=False)
+        values    = data[:, picks].mean(axis=0) * 100
+        limit     = max(1, float(np.quantile(np.abs(values), .98)))
+        for i, ax in enumerate(axes[:, 0]):
+            im = ax.pcolormesh(power.times, power.freqs, values[i], cmap='RdBu_r', vmin=-limit, vmax=limit, shading='auto')
+            ax.axvline(0, color='0.3', ls='--')
+            ax.set(title=power.ch_names[picks[i]], ylabel='Hz')
+        axes[-1, 0].set_xlabel('Tempo desde ATTEMPT (s)')
+        fig.colorbar(im, ax=list(axes[:, 0]), label='ERD/ERS (%) · azul: redução / vermelho: aumento')
+        fig.suptitle(f'Tempo–frequência · {cls} · canais centrais')
+        yield f'tfr_central_{cls}', fig
+
+
+def erd_metrics(power, cfg):
+    rows = []
+    if power is None:
+        return pd.DataFrame(columns=['trial', 'class', 'channel', 'band', 'erd_percent'])
+    active = (power.times >= cfg['active'][0]) & (power.times <= cfg['active'][1])
+    for i, trial in enumerate(power.metadata.itertuples()):
+        for band in ['mu', 'beta']:
+            keep = (power.freqs >= cfg[band][0]) & (power.freqs < cfg[band][1])
+            for ch in central_picks(power.info):
+                rows.append(dict(trial=int(trial.trial), **{'class': trial.trial_class}, channel=power.ch_names[ch], band=band,
+                                 erd_percent=float(power.data[i, ch, keep][:, active].mean() * 100)))
+    return pd.DataFrame(rows)
 
 
 def spectral_plot(ax, epochs, cfg):
@@ -83,31 +225,64 @@ def spectral_plot(ax, epochs, cfg):
     ax.legend(fontsize=7)
 
 
-def baseline_trials(run, epochs, cfg):
-    valid, reasons = [], []
+def baseline_intervals(run, epochs, cfg):
+    intervals = []
     for row in epochs.metadata.itertuples():
-        start, end = np.asarray(cfg["baseline"]) + row.attempt_start
-        previous   = run.trials[run.trials.trial < row.trial]
-        pause      = previous.iloc[-1].pause_start if len(previous) else np.nan
-        ok         = bool(np.isfinite(pause) and start >= pause and end <= row.attention_start)
-        valid.append(ok)
-        reasons.append(dict(trial=int(row.trial), baseline_in_pause=ok,
-                            reason="" if ok else "Baseline não contida em PAUSA anterior conhecida; ERD excluído."))
-    return np.array(valid), pd.DataFrame(reasons)
+        previous = run.trials[run.trials.trial < row.trial]
+        pause    = previous.iloc[-1].pause_start if len(previous) else np.nan
+        if cfg["erd_baseline_mode"] == "preceding_pause" and np.isfinite(pause):
+            end   = row.attention_start - .25
+            start = max(pause + .25, end - 1.5)
+        else:
+            start, end = np.asarray(cfg["baseline"]) + row.attempt_start
+        valid = bool(np.isfinite(pause) and start >= max(pause, run.times[0]) and end <= row.attention_start and end - start >= .5)
+        intervals.append((start - row.attempt_start, end - row.attempt_start) if valid else None)
+    return intervals
+
+
+def baseline_trials(run, epochs, cfg):
+    intervals = baseline_intervals(run, epochs, cfg)
+    valid     = np.array([v is not None for v in intervals])
+    audit     = pd.DataFrame([dict(trial=int(row.trial), baseline_in_pause=ok,
+                              baseline_start_s=interval[0] if ok else np.nan,
+                              baseline_end_s=interval[1] if ok else np.nan,
+                              reason="" if ok else "PAUSA anterior ausente/curta/fora do EEG; ERD excluído.")
+                          for row, ok, interval in zip(epochs.metadata.itertuples(), valid, intervals)])
+    return valid, audit
 
 
 def time_frequency(run, epochs, cfg):
+    intervals    = baseline_intervals(run, epochs, cfg)
     valid, audit = baseline_trials(run, epochs, cfg)
     if not valid.any():
         return None, audit
-    used  = epochs[np.flatnonzero(valid)]
-    freqs = np.array(cfg["frequencies"], float)
+    used      = epochs[np.flatnonzero(valid)]
+    intervals = {int(row.trial): interval for row, interval in zip(epochs.metadata.itertuples(), intervals) if interval is not None}
+    tmin      = min(cfg["epoch_tmin"], min(v[0] for v in intervals.values()) - .5)
+    used      = mne.Epochs(run.clean, events=used.events, event_id=used.event_id, tmin=tmin, tmax=cfg["epoch_tmax"],
+                      baseline=None, preload=True, metadata=used.metadata, verbose=False)
+    accepted  = []
+    for i, row in enumerate(used.metadata.itertuples()):
+        start, end = intervals[int(row.trial)]
+        data       = used.get_data(picks=mne.pick_types(used.info, eeg=True, exclude="bads"))[i]
+        data       = data[:, (used.times >= start) & (used.times <= end)]
+        if data.shape[-1] and np.all(np.ptp(data, axis=1) <= cfg["reject_uv"] * 1e-6) and np.all(np.ptp(data, axis=1) >= cfg["flat_uv"] * 1e-6):
+            accepted.append(i)
+    used = used[accepted]
+    keep = set(used.metadata.trial)
+    for i, row in audit.iterrows():
+        if row.baseline_in_pause and row.trial not in keep:
+            audit.loc[i, ["baseline_in_pause", "reason"]] = [False, "Contexto indisponível ou artefato na baseline."]
+    if not len(used):
+        return None, audit
+    freqs = np.asarray(cfg["frequencies"], float)
     if freqs.max() > cfg["h_freq"] or freqs.min() < cfg["l_freq"]:
         raise ValueError("Frequências TFR fora do filtro eletrofisiológico.")
-    power = used.compute_tfr(method="morlet", freqs=freqs, n_cycles=freqs / 2,
-                             return_itc=False, average=False, picks="eeg", decim=max(1, round(used.info["sfreq"] / 64)),
-                             n_jobs=1, verbose=False)
-    power.apply_baseline(tuple(cfg["baseline"]), mode="percent", verbose=False)
+    power = used.compute_tfr(method="morlet", freqs=freqs, n_cycles=freqs / 2, return_itc=False,
+                             average=False, picks=mne.pick_types(used.info, eeg=True, exclude="bads"), decim=max(1, round(used.info["sfreq"] / 64)), n_jobs=1, verbose=False)
+    for i, row in enumerate(used.metadata.itertuples()):
+        mne.baseline.rescale(power.data[i], power.times, intervals[int(row.trial)], mode="percent", copy=False, verbose=False)
+    power.crop(cfg["epoch_tmin"], cfg["epoch_tmax"])
     return power, audit
 
 
@@ -209,7 +384,7 @@ def pca_figure(epochs, cfg):
     return fig
 
 
-def classifier_figure(summary, predictions):
+def classifier_figure(summary, predictions, cfg):
     labels    = summary["labels"]
     fig, axes = plt.subplots(2, 2, figsize=(14, 9), layout="constrained")
     cm        = np.array(summary["confusion_matrix"])
@@ -223,31 +398,27 @@ def classifier_figure(summary, predictions):
     axes[0, 1].plot(range(1, len(scores) + 1), scores, "o-", color="0.3")
     axes[0, 1].axhline(summary["chance"], color="0.5", ls="--")
     axes[0, 1].set(ylim=(0, 1), xlabel="Fold externo / avaliação externa", ylabel="Balanced accuracy", title=f"BA agrupada: {summary['balanced_accuracy']:.3f}")
-    trials = sorted(predictions.trial.unique())
-    rank   = {t: i / max(1, len(trials) - 1) for i, t in enumerate(trials)}
+    context = pd.DataFrame(summary.get("_timeline", []))
+    values  = smoothed_timeline(context, cfg["curve_smoothing_s"]) if len(context) else predictions.assign(trial_class=predictions.target)
+    trials  = sorted(values.trial.unique())
+    rank    = {t: i / max(1, len(trials) - 1) for i, t in enumerate(trials)}
     for cls in labels:
-        # Não interpolar através das lacunas de fases nem prolongar trials curtos.
-        sub    = predictions[predictions.target == cls]
         traces = []
-        for trial, values in sub.groupby("trial", sort=True):
-            values = values.sort_values("time_end")
-            axes[1, 0].plot(values.time_end, values[f"p_{cls}"], color=COLORS[cls], alpha=0.08 + 0.35 * rank[trial], lw=0.7)
-            trace = pd.Series(values[f"p_{cls}"].to_numpy(), index=values.time_end.round(4))
-            traces.append(trace[~trace.index.duplicated()])
+        for trial, sub in class_trials(values, cls):
+            axes[1, 0].plot(sub.time_end, sub[f"p_{cls}"], color=COLORS[cls], alpha=.08 + .35 * rank[trial], lw=.7)
+            traces.append(pd.Series(sub[f"p_{cls}"].to_numpy(), index=sub.time_end))
         if traces:
-            frame = pd.concat(traces, axis=1)
-            mean  = frame.mean(axis=1).sort_index()
-            axes[1, 0].plot(mean.index, mean.values, color=COLORS[cls], lw=2, label=f"P({cls}) | real={cls}")
-        for _, values in predictions.groupby(["trial", "phase"], sort=True):
-            values = values.sort_values("start_abs")
-            axes[1, 1].plot(values.start_abs - predictions.start_abs.min(), values[f"p_{cls}"], color=COLORS[cls], lw=0.7, alpha=0.7)
+            grid, mean, support = mean_curve(traces, cfg)
+            axes[1, 0].plot(grid, mean, color=COLORS[cls], lw=2, label=cls)
+        for _, sub in values.groupby("trial"):
+            axes[1, 1].plot(sub.start_abs - values.start_abs.min(), sub[f"p_{cls}"], color=COLORS[cls], lw=.9)
     for ax in axes[1]:
         ax.axhline(summary["chance"], color="0.5", ls="--", lw=0.8)
         ax.set(ylim=(0, 1), ylabel="Probabilidade calibrada")
     axes[1, 0].axvline(0, color="0.4", ls=":")
     axes[1, 0].set(title="Trials antigos: claros → recentes: escuros; média destacada", xlabel="Fim da janela relativo ao ATTEMPT (s)")
     axes[1, 0].legend(fontsize=7)
-    axes[1, 1].set(title="Saídas em janelas de teste · lacunas sem inferência", xlabel="Tempo desde primeira janela (s)")
+    axes[1, 1].set(title=f"Timeline de teste · suavização causal {cfg['curve_smoothing_s']} s", xlabel="Tempo desde primeira janela (s)")
     fig.suptitle(f"{summary['protocol']} · {summary['validation']} · fonte REST: {summary['rest_source']}")
     return fig
 
@@ -259,7 +430,7 @@ def detailed_trials(run, before, after, report):
     for i, row in enumerate(before.metadata.itertuples()):
         fig, axes = plt.subplots(2, 1, figsize=(12, 9), sharex=True, layout="constrained")
         data      = before.get_data(picks=picks)[i]
-        scale     = max(20, float(np.quantile(np.ptp(data, axis=1) * 1e6, 0.8)))
+        scale     = max(20, float(np.quantile((np.quantile(data,.99,axis=1)-np.quantile(data,.01,axis=1)) * 1e6, .8)))
         stacked(axes[0], data, before.times, names, scale, "Antes do pré-processamento")
         if row.trial in accepted:
             stacked(axes[1], after.get_data(picks=picks)[accepted[row.trial]], after.times, names, scale, "Depois do pré-processamento")
@@ -287,7 +458,7 @@ def calibration_row(row, included):
     return candidates.sort_values("stamp").iloc[-1]
 
 
-def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocols=None, included=None):
+def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocols=None, included=None, compare=False):
     directory.mkdir(parents=True, exist_ok=True)
     run                   = load_run(root, row, cfg)
     before, epochs, audit = make_epochs(run, cfg)
@@ -295,7 +466,7 @@ def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocol
     run.trials.to_csv(directory / "trials.csv", index=False)
     if len(epochs) < 2:
         raise ValueError("Menos de duas épocas aceitas; consultar epoch_audit.csv.")
-    report     = mne.Report(title=f"{row.subject} · {row.session} · {row.block_type} · {row.run_id}", verbose=False)
+    report     = Report(title=f"{row.subject} · {row.session} · {row.block_type} · {row.run_id}", verbose=False)
     provenance = dict(created_utc=datetime.now(timezone.utc).isoformat(), config=cfg, control=row.to_dict(), qc=run.qc,
                       files={name: fingerprint(Path(root) / row[name]) for name in ["signal_path", "marker_path"]},
                       versions={p: importlib.metadata.version(p) for p in ["mne", "numpy", "scipy", "scikit-learn", "pyriemann"]},
@@ -303,15 +474,32 @@ def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocol
                              "Referência média altera o sinal; canais ruins são excluídos, sem interpolação.",
                              "Nenhum ICA automático sem EOG ou inspeção; amplitude/flatness não identificam todo artefato.",
                              "ERP é inspeção descritiva; ausência de efeito não prova ausência de resposta."])
+    report.add_html(f'<div class="cards"><div class="card">Trials<strong>{len(run.trials)}</strong></div><div class="card">Épocas aceitas<strong>{len(epochs)}/{len(audit)}</strong></div><div class="card">Exclusões manuais<strong>{int(run.trials.manual_exclusion.sum())}</strong></div><div class="card">Canais excluídos<strong>{len(run.raw.info["bads"])}</strong></div></div>'
+                    '<p>Escalas em µV. Centralização dos overlays é apenas visual; arquivos e amplitudes de análise não são alterados.</p>', title="Resumo · qualidade e inclusão")
+    quality, quality_fig = quality_checks(run, audit, cfg)
+    quality.to_csv(directory / "channel_quality.csv", index=False)
+    flagged = quality.loc[quality.flag != "sem alerta relativo", "channel"].tolist()
+    causes  = audit.loc[~audit.accepted, "drop_reason"].value_counts().to_dict()
+    report.add_html(f"<p>Canais excluídos manualmente: {html.escape(', '.join(run.raw.info['bads']) or 'nenhum')}. "
+                    f"Variação pós-filtro abaixo de 0,2× ou acima de 5× a mediana dos canais: {html.escape(', '.join(flagged) or 'nenhum')}. "
+                    f"Causas das rejeições: {html.escape(str(causes) if causes else 'nenhuma')}.</p>"
+                    "<p>Alertas relativos não excluem canais automaticamente. O gráfico de ruído é uma triagem de potência em 50/60 Hz, não um diagnóstico de origem do artefato.</p>", title="Resumo · sanity checks")
+
+    report.add_html(quality.to_html(index=False, float_format=lambda x: f"{x:.2f}"), title="Qualidade · canais e ruído")
+    save_figure(quality_fig, directory, "sanity_checks", cfg, report)
     report.add_html("<pre>" + html.escape(json.dumps(provenance, indent=2, ensure_ascii=False)) + "</pre>", title="Parâmetros, proveniência e sanity check")
     report.add_html(audit.to_html(index=False), title="Aceitação/rejeição das épocas")
     metrics, power, primary = [], None, None
     if mode in {"both", "ephys"}:
         save_figure(raw_figure(run, cfg), directory, "raw_antes_depois", cfg, report)
+        report.add_plotly(overlay_plot(*raw_snapshot(run), "Snapshot do meio do bloco"), "Raw antes/depois · zoom por canal")
+        for name, fig in erp_figures(epochs, cfg):
+            save_figure(fig, directory, name, cfg, report)
         save_figure(epoch_figure(epochs), directory, "epocas_canais", cfg, report)
         save_figure(pca_figure(epochs, cfg), directory, "pca_2d_3d", cfg, report)
         power, baseline_audit = time_frequency(run, epochs, cfg)
         baseline_audit.to_csv(directory / "baseline_audit.csv", index=False)
+        erd_metrics(power, cfg).to_csv(directory / "erd_metrics.csv", index=False)
         report.add_html(baseline_audit.to_html(index=False), title="Validade da baseline para ERD/ERS")
         for name, fig in tfr_figures(power, cfg):
             save_figure(fig, directory, name, cfg, report)
@@ -319,14 +507,11 @@ def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocol
         erp_plot(axes[0], epochs, cfg)
         spectral_plot(axes[1], epochs, cfg)
         save_figure(fig, directory, "erp_espectro", cfg, report)
-        data             = run.clean.get_data(picks="eeg", reject_by_annotation="omit")
-        freq, time, spec = spectrogram(data, fs=run.clean.info["sfreq"], nperseg=min(256, data.shape[-1]), axis=-1)
-        keep             = (freq >= 1) & (freq <= cfg["h_freq"])
-        fig, ax          = plt.subplots(figsize=(12, 4), layout="constrained")
-        im               = ax.pcolormesh(time, freq[keep], 10 * np.log10(np.maximum(spec[:, keep].mean(axis=0) * 1e12, 1e-20)), cmap="Greys", shading="auto")
-        ax.set(title="Espectrograma contínuo · média de potência dos canais", xlabel="Tempo (s)", ylabel="Hz")
-        fig.colorbar(im, ax=ax, label="dB (µV²/Hz)")
-        save_figure(fig, directory, "espectrograma", cfg, report)
+        save_figure(central_spectrogram(run, cfg), directory, "espectrograma", cfg, report)
+        for name, fig in central_erd_figures(power, cfg):
+            save_figure(fig, directory, name, cfg, report)
+        if power is None:
+            report.add_html("<p>ERD/ERS indisponível: nenhuma PAUSA anterior utilizável após inspeção de contexto e artefatos. Consulte baseline_audit.csv. O espectrograma contínuo permanece disponível.</p>", title="Resumo · ERD/ERS indisponível")
     if mode in {"both", "classification"}:
         from classify import evaluate, save_result
         training, train_source = None, "nested_trial_cv"
@@ -339,20 +524,29 @@ def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocol
                 train_source       = train_row.run_id
             except ValueError as exc:
                 train_source = f"BLOCKED: {exc}"
+        variants = cfg["comparison_pipelines"] if compare else ["nested_selection" if len(cfg["pipelines"]) > 1 else cfg["pipelines"][0]]
         for protocol in protocols or list(PROTOCOLS):
-            try:
-                if train_source.startswith("BLOCKED:"):
-                    raise ValueError(train_source)
-                result = evaluate(run, cfg, protocol, set(epochs.metadata.trial), training)
-                if primary is None:
-                    primary = result
-                result[0]["train_source"] = train_source
-                save_result(result, directory)
-                save_figure(classifier_figure(result[0], result[1]), directory, f"classificacao_{protocol}", cfg, report)
-                metrics.append(dict(protocol=protocol, status="ok", balanced_accuracy=result[0]["balanced_accuracy"],
-                                    chance=result[0]["chance"], validation=result[0]["validation"], train_source=train_source))
-            except (ValueError, np.linalg.LinAlgError) as exc:
-                metrics.append(dict(protocol=protocol, status=str(exc)))
+            for variant in variants:
+                try:
+                    if train_source.startswith("BLOCKED:"):
+                        raise ValueError(train_source)
+                    experiment = {**cfg, "pipelines": [variant]} if compare else cfg
+                    result     = evaluate(run, experiment, protocol, set(epochs.metadata.trial), training)
+                    if primary is None:
+                        primary = result
+                    result[0]["train_source"] = train_source
+                    result[0]["pipeline"]     = variant
+                    prefix                    = f"{variant}_" if compare else ""
+                    save_result(result, directory, prefix)
+                    save_figure(classifier_figure(result[0], result[1], cfg), directory, f"classificacao_{prefix}{protocol}", cfg, report)
+                    context = pd.DataFrame(result[0].get("_timeline", []))
+                    if len(context):
+                        report.add_plotly(timeline_plot(result[0], context, cfg), f"Classificador · {variant} · {protocol} · zoom")
+                    metrics.append(dict(protocol=protocol, pipeline=variant, status="ok", balanced_accuracy=result[0]["balanced_accuracy"],
+                                        chance=result[0]["chance"], validation=result[0]["validation"], train_source=train_source,
+                                        n_trials=result[0]["n_trials"]))
+                except (ValueError, np.linalg.LinAlgError) as exc:
+                    metrics.append(dict(protocol=protocol, pipeline=variant, status=str(exc)))
         report.add_html(pd.DataFrame(metrics).to_html(index=False), title="Classificação · resultados e impedimentos")
     fig, axes = plt.subplots(3, 4, figsize=(24, 16), layout="constrained")
     if mode in {"both", "ephys"}:
@@ -402,18 +596,18 @@ def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocol
         axes[2, 1].axis("off")
         axes[2, 1].text(0, 0.5, "Classificação não executada ou indisponível.\nConsultar relatório HTML.")
     if primary is not None:
-        predictions = primary[1]
+        predictions = smoothed_timeline(pd.DataFrame(primary[0]["_timeline"]), cfg["curve_smoothing_s"])
         trials      = sorted(predictions.trial.unique())
         rank        = {t: i / max(1, len(trials) - 1) for i, t in enumerate(trials)}
         for cls in primary[0]["labels"]:
             traces = []
-            for trial, sub in predictions[predictions.target == cls].groupby("trial"):
+            for trial, sub in class_trials(predictions, cls):
                 sub = sub.sort_values("time_end")
                 axes[2, 2].plot(sub.time_end, sub[f"p_{cls}"], color=COLORS[cls], alpha=0.08 + 0.35 * rank[trial], lw=0.7)
                 traces.append(pd.Series(sub[f"p_{cls}"].to_numpy(), index=sub.time_end.round(4)))
             if traces:
-                mean = pd.concat(traces, axis=1).mean(axis=1).sort_index()
-                axes[2, 2].plot(mean.index, mean.values, color=COLORS[cls], lw=2, label=cls)
+                grid, mean, support = mean_curve(traces, cfg)
+                axes[2, 2].plot(grid, mean, color=COLORS[cls], lw=2, label=cls)
         axes[2, 2].set(title=f"{primary[0]['protocol']} · claros: antigos → escuros: recentes", xlabel="Fim da janela desde ATTEMPT (s)", ylabel="P(classe correta)", ylim=(0, 1))
         axes[2, 2].legend(fontsize=7)
     else:
@@ -452,7 +646,7 @@ def diagnose_run(root, row, cfg, protocols=None):
 
     for field, required in [("signal_path", {"lsl_time_s"}), ("marker_path", {"lsl_time_s", "label"})]:
         try:
-            frame = pd.read_csv(Path(root) / row[field])
+            frame   = pd.read_csv(Path(root) / row[field])
             missing = required - set(frame)
             if missing:
                 raise ValueError(f"Colunas ausentes: {sorted(missing)}")
@@ -474,7 +668,7 @@ def diagnose_run(root, row, cfg, protocols=None):
             invalid = run.trials[~run.trials.valid]
             if len(invalid):
                 add("trials", "warning", f"{len(invalid)} trials inválidos/excluídos: {invalid.trial.tolist()}", "Conferir sequência dos marcadores e exclusões manuais.")
-            durations = {phase: (run.trials[f"{phase}_end"] - run.trials[f"{phase}_start"]).describe().to_dict()
+            durations                 = {phase: (run.trials[f"{phase}_end"] - run.trials[f"{phase}_start"]).describe().to_dict()
                          for phase in ["attention", "attempt", "pause"]}
             result["phase_durations"] = durations
         except Exception as exc:
@@ -482,16 +676,16 @@ def diagnose_run(root, row, cfg, protocols=None):
             result["traceback"] = traceback.format_exc()
     if run is not None:
         try:
-            _, epochs, audit = make_epochs(run, cfg)
-            result["epoch_audit"] = audit.to_dict("records")
+            _, epochs, audit          = make_epochs(run, cfg)
+            result["epoch_audit"]     = audit.to_dict("records")
             result["accepted_epochs"] = len(epochs)
             add("epochs", "ok" if len(epochs) >= 2 else "error",
                 f"{len(epochs)}/{len(audit)} épocas aceitas; rejeições: {audit.loc[~audit.accepted, 'drop_reason'].value_counts().to_dict()}",
                 "Revisar artefatos, unidades e canais; não aumentar limiar automaticamente." if len(epochs) < len(audit) else "")
             if len(epochs):
-                valid, baseline = baseline_trials(run, epochs, cfg)
+                valid, baseline          = baseline_trials(run, epochs, cfg)
                 result["baseline_audit"] = baseline.to_dict("records")
-                action = ""
+                action                   = ""
                 if not valid.any():
                     intervals = []
                     for trial in epochs.metadata.itertuples():
@@ -500,13 +694,13 @@ def diagnose_run(root, row, cfg, protocols=None):
                             intervals.append((previous.iloc[-1].pause_start - trial.attempt_start + 0.25,
                                               trial.attention_start - trial.attempt_start - 0.25))
                     if intervals:
-                        low = max(v[0] for v in intervals)
+                        low  = max(v[0] for v in intervals)
                         high = min(v[1] for v in intervals)
                         if high - low >= 0.5:
-                            suggestion = dict(baseline=[round(low, 3), round(high, 3)],
+                            suggestion                     = dict(baseline=[round(low, 3), round(high, 3)],
                                               epoch_tmin=round(min(cfg["epoch_tmin"], low - 0.5), 3))
                             result["suggested_erd_config"] = suggestion
-                            action = f"PAUSA comum com margem de 250 ms: {suggestion}. Sugestão não aplicada; revisar e reexecutar check."
+                            action                         = f"PAUSA comum com margem de 250 ms: {suggestion}. Sugestão não aplicada; revisar e reexecutar check."
                     if not action:
                         action = "Sem PAUSA comum suficiente: revisar protocolo ou usar baseline por trial; não substituir por ATTENTION."
                 add("erd_baseline", "ok" if valid.any() else "warning", f"{int(valid.sum())}/{len(epochs)} baselines contidas em PAUSA.", action)
@@ -515,7 +709,7 @@ def diagnose_run(root, row, cfg, protocols=None):
                     try:
                         datasets, rejected = prepare(run, cfg, protocol, set(epochs.metadata.trial),
                                                      require_cv=not row.block_type.startswith("online_"))
-                        meta = datasets[0][2]
+                        meta               = datasets[0][2]
                         if row.block_type.startswith("online_"):
                             add(protocol, "ok", f"{len(datasets)} candidatos de teste; {meta.trial.nunique()} trials. Treino proxy verificado separadamente; modelos não ajustados.")
                         else:
@@ -570,7 +764,7 @@ def check_dataset(root, control, output, cfg, subjects=None, sessions=None, bloc
 
 
 def batch(root, control, output, cfg, subjects=None, sessions=None, blocks=None, runs=None,
-          mode="both", detailed=False, protocols=None):
+          mode="both", detailed=False, protocols=None, compare=False):
     selected = selection(control, subjects, sessions, blocks, runs)
     included = selection(control)
     if selected.empty:
@@ -583,7 +777,7 @@ def batch(root, control, output, cfg, subjects=None, sessions=None, blocks=None,
     for _, row in selected.iterrows():
         print(f"Analisando {row.run_id}", flush=True)
         try:
-            results.append(analyze_run(root, row, cfg, output / row.run_id, mode, detailed, protocols, included))
+            results.append(analyze_run(root, row, cfg, output / row.run_id, mode, detailed, protocols, included, compare))
         except Exception as exc:
             traceback.print_exc()
             folder = output / row.run_id
@@ -593,9 +787,10 @@ def batch(root, control, output, cfg, subjects=None, sessions=None, blocks=None,
                                 block_type=row.block_type, status=f"{type(exc).__name__}: {exc}"))
         finally:
             plt.close("all")
+    batch_comparison(output, results)
     (output / "batch_results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
     flat = [{**{k: v for k, v in r.items() if k != "classification"}, **metric}
-            for r in results for metric in r.get("classification", [dict(protocol="ephys")])]
+            for r in results for metric in (r.get("classification") or [dict(protocol="ephys")])]
     pd.DataFrame(flat).to_csv(output / "summary.csv", index=False)
     cards = []
     for row in results:
@@ -605,7 +800,7 @@ def batch(root, control, output, cfg, subjects=None, sessions=None, blocks=None,
         cards.append(f"<article><h2>{rid}</h2><p>{status}</p>{content}</article>")
     (output / "index.html").write_text('<!doctype html><html lang="pt-BR"><meta charset="utf-8">'
         '<title>EEG · análise batch</title><style>body{font:16px system-ui;max-width:1500px;margin:32px auto;padding:20px;background:#f6f6f6}article{background:white;padding:24px;margin:24px 0}img{width:100%;height:auto}h2{overflow-wrap:anywhere}</style>'
-        '<h1>EEG · análise batch</h1><p><a href="diagnostics.html">Check de todos os registros</a></p><p>Resultados descritivos offline. Consulte parâmetros, rejeições e validação em cada relatório.</p>'
+        '<h1>EEG · análise batch</h1><p><a href="comparison.html">Comparação entre sujeitos e pipelines</a></p><p><a href="diagnostics.html">Check de todos os registros</a></p><p>Resultados descritivos offline. Consulte parâmetros, rejeições e validação em cada relatório.</p>'
         + "".join(cards) + "</html>")
     return results
 
@@ -622,6 +817,7 @@ def main():
     parser.add_argument("--blocks", nargs="+")
     parser.add_argument("--runs", nargs="+")
     parser.add_argument("--protocols", nargs="+", choices=list(PROTOCOLS))
+    parser.add_argument("--compare-pipelines", action="store_true", help="Compara pipelines separadamente, com busca aninhada em cada uma.")
     parser.add_argument("--mode", choices=["ephys", "classification", "both"], default="both")
     args    = parser.parse_args()
     control = args.control or args.root / "dataset_index.csv"
@@ -637,7 +833,7 @@ def main():
             print(f"Diagnóstico: {output.resolve()}")
             raise SystemExit(int(any(r["status"] == "error" for r in results)))
         results = batch(args.root, control, output, settings(args.config), args.subjects, args.sessions,
-                        args.blocks, args.runs, args.mode, args.command == "report", args.protocols)
+                        args.blocks, args.runs, args.mode, args.command == "report", args.protocols, args.compare_pipelines)
         print(f"Relatórios: {output.resolve()}")
         if any(r["status"] != "ok" or any(m["status"] != "ok" for m in r.get("classification", [])) for r in results):
             raise SystemExit(1)

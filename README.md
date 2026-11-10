@@ -1,263 +1,179 @@
 # EEG/BCI · análise local
 
-Conversão do `batch_analysis.ipynb` para execução local, sem Colab ou Google Drive.
-Quatro arquivos de código: `eeg.py` (dados/controle), `analyze.py` (eletrofisiologia e relatórios),
-`classify.py` (modelos/validação) e `app.py` (interface). Os dados permanecem na pasta escolhida.
+Análise dos CSVs `signal/markers`, com controle manual, relatórios individuais com zoom
+e comparação batch entre sujeitos e pipelines. Dados permanecem na pasta escolhida.
 
-## Instalação e interface
+## Iniciar
 
-Python **3.12** recomendado. No terminal, dentro deste repositório:
+Python 3.12 recomendado, dentro da pasta do repositório:
 
 ```bash
-python -m venv .venv
-# Linux/macOS
+python3 -m venv .venv
 source .venv/bin/activate
-# Windows PowerShell: .venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
-Na interface:
+No Windows, ative com `.venv\Scripts\Activate.ps1`.
+Após atualizar o código, instale as dependências e reinicie o Streamlit. Relatórios antigos
+não são modificados: gere uma nova execução para usar o novo formato.
 
-1. Informe a pasta local dos dados e clique em **Atualizar índice**.
-2. Em **Controle dos dados**, marque `include`, revise o tipo de bloco e salve.
-3. Selecione sujeitos, sessões, blocos ou registros na barra lateral; vazio significa todos.
-4. Em **Produzir relatório**, escolha eletrofisiologia, classificação ou ambas. Ative a inspeção
-   de cada época para relatórios minuciosos. Escolha os protocolos e gere os relatórios.
-5. Consulte as imagens e baixe o HTML em **Consultar resultados**. Também pode abrir
-   `analysis_outputs/<execução>/index.html` diretamente no navegador.
+## Fluxo na interface
 
-A interface executa a análise localmente e não faz upload de gravações. Uma análise extensa
-pode demorar; comece com um registro e `left_right`. A busca padrão avalia até 12 candidatos
-por fold, não toda a grade. Cada execução cria sua própria pasta, evitando misturar resultados.
-Os gráficos são PNG a 300 dpi e PDF vetorial; o HTML MNE contém as figuras e tabelas.
+1. Informe a pasta dos dados e clique em **Atualizar índice**.
+2. Em **Controle dos dados**, marque `include`, revise `block_type` e salve.
+3. Filtre sujeitos, sessões, blocos e registros na barra lateral; vazio significa todos.
+4. Execute **Verificar dados antes da análise**. O check informa erro/aviso e ação por registro.
+5. Em **Produzir relatório**, escolha eletrofisiologia, classificação ou ambas.
+6. Para comparação, marque **Batch comparativo: avaliar TGSP e CSP separadamente**.
+   Em **Ajustar experimento e visualização**, selecione janelas, offsets, bandas/bancos, C do SVM e orçamento de busca.
+7. Gere os relatórios. Em **Consultar resultados**, baixe o HTML individual ou o comparativo.
 
-## Formato de entrada e controle manual
+Abra o HTML no navegador: os gráficos interativos têm zoom por seleção, roda, pan e
+restauração por duplo clique. A legenda permite ocultar traços. Figuras estáticas abrem
+em um visualizador com zoom e arraste. Tudo funciona offline, incluindo os gráficos Plotly.
+Dados técnicos, tabelas e figuras extensas começam recolhidos.
 
-Formato preservado do notebook:
+## Batch comparativo
 
-```text
-dados/AB01/S1/IM_treino/..._signal_20260101_120000.csv
-dados/AB01/S1/IM_treino/..._markers_20260101_120000.csv
-```
-
-O sinal requer `lsl_time_s`, `ch1` até `ch15`; os marcadores requerem `lsl_time_s`, `label`.
-O par deve diferir apenas por `_signal_` / `_markers_`. O mapa de canais é o mesmo do notebook:
-FC3, FCz, C5, C3, FC4, C1, CP3, Cz, C2, C4, CP1, CPz, CP4, CP2, C6.
-Usa-se a montagem MNE `colin27_1020`, ou seu nome legado equivalente `standard_1020`
-quando o primeiro não existe na versão instalada. São posições padronizadas, não digitalização
-individual. O QC registra a montagem escolhida e o diagnóstico inclui as versões das bibliotecas,
-mesmo quando o pré-processamento falha.
-Os topomapas usam interpolação linear local sobre uma cobertura sensorimotora limitada,
-evitando extrapolar para todo o escalpo ou introduzir extremos por interpolação cúbica.
-
-**Confirme a unidade dos CSVs**: `scale_to_volts=1e-6` presume µV, como no notebook.
-Se os valores já estiverem em volts, use `1.0`. Os timestamps de sinal e marcadores
-precisam compartilhar o relógio LSL e estar em segundos.
-
-`dataset_index.csv` pode ser editado pela interface ou por uma planilha:
-
-| Campo | Uso |
-| --- | --- |
-| `include` | `True` inclui, `False` exclui; novos registros começam excluídos |
-| `block_type` | `IM_treino`, `EM_treino`, `online_com_feedback`, `online_sem_feedback` |
-| `group` | Rótulo de grupo preservado nos metadados; não gera inferência estatística automática |
-| `bad_channels` | Canais a excluir, separados por vírgula, por exemplo `C3,CPz` |
-| `exclude_trials` | IDs originais a excluir, **começando em zero**, por exemplo `0,3,8` |
-| `reason` | Justificativa manual, registrada no relatório |
-| `train_run_id` | Opcional: registro IM anterior usado como calibração proxy para online |
-
-Online sem identificação de feedback é tratado como `online_com_feedback`.
-O valor legado `online_definir` também é convertido ao ler ou atualizar a tabela, preservando `include`.
-Sujeito/sessão são inferidos como no notebook (`AB01`, `S1`); revise `UNKNOWN` na tabela
-se a organização de pastas for diferente. Caminhos novos são relativos à pasta dos dados,
-permitindo movê-la entre máquinas. Atualizar o índice preserva decisões manuais, mantém
-registros desaparecidos com `available=False` e não remove silenciosamente exclusões.
-Pares incompletos são indexados e produzem erro explícito se incluídos.
-
-## Execução por terminal
+Sem selecionar um sujeito, o batch processa todos os registros incluídos. Restrinja um tipo
+de bloco para facilitar comparações equivalentes. Comece por `left_right` para conferir os dados.
 
 ```bash
 python analyze.py index --root "/caminho/dados"
-# Editar dataset_index.csv antes de continuar.
-python analyze.py batch --root "/caminho/dados" --subjects AB01 AB02 --mode ephys
-python analyze.py batch --root "/caminho/dados" --subjects AB01 --blocks IM_treino --mode classification --protocols left_right
-python analyze.py report --root "/caminho/dados" --subjects AB01 --sessions S1 --protocols left_right rest_move
+# Editar include e block_type em dataset_index.csv.
+python analyze.py check --root "/caminho/dados"
+python analyze.py batch --root "/caminho/dados" --blocks IM_treino --mode both --protocols left_right --compare-pipelines
+python analyze.py report --root "/caminho/dados" --subjects AB01 --sessions S1 --protocols left_right
 ```
 
-`batch` produz resumo e figuras por registro; `report` acrescenta cada época antes/depois.
-Sem filtros, entram todos os registros incluídos e com tipo de bloco definido.
-Também existem `--runs`, `--control`, `--output` e `--config`. As duas análises podem ser
-executadas independentemente com `--mode ephys` ou `--mode classification`.
-O comando termina com código 1 se um registro ou protocolo solicitado não puder ser analisado;
-os resultados bem-sucedidos são preservados e o motivo consta no HTML/JSON.
+`batch` gera resumo e figuras por registro; `report` acrescenta cada época antes/depois.
+Os filtros `--subjects`, `--sessions`, `--blocks` e `--runs` são opcionais. Também existem
+`--config`, `--control`, `--output` e `--mode ephys|classification|both`.
 
-## Check antes do batch
+`comparison.html` mostra BA por sujeito/pipeline e ERD/ERS central por classe e banda.
+`comparison_runs.csv` conserva cada registro; `comparison_subjects.csv` agrega as repetições
+dentro de cada sujeito; `pipeline_paired_differences.csv` contém diferenças pareadas de BA.
+`erd_subjects.csv` agrega primeiro os trials por registro e depois os registros por sujeito.
+Janelas e folds não contam como sujeitos independentes. As comparações são descritivas,
+sem teste de significância automático; não estimam generalização para sujeitos inéditos.
+Blocos, protocolos, CV e avaliação online proxy ficam separados.
 
-Na interface, clique em **Verificar dados antes da análise**, depois de salvar a tabela.
-Pelo terminal:
+Com a comparação ativada, cada pipeline tem sua própria busca interna e avaliação externa.
+Sem ela, `pipelines` no JSON controla uma pipeline ou uma seleção aninhada entre várias.
+O orçamento limita candidatos por busca; `comparison_pipelines` define as famílias a comparar.
 
-```bash
-python analyze.py check --root "/caminho/dados" --subjects AB01
-```
+## O que aparece no relatório individual
 
-O check não treina modelos. Ele verifica os dois CSVs independentemente, leitura e colunas,
-relógio, marcadores nas bordas, pré-processamento, sequência/duração de fases, rejeição de
-épocas, baseline em PAUSA, classes e disponibilidade de folds por trial. Candidatos com
-janelas/offsets que não suportam CV são descartados antes de calcular a interseção de trials;
-um candidato inviável não deve inutilizar os candidatos mais curtos.
+- **Resumo:** trials, épocas aceitas/rejeitadas, exclusões manuais e canais excluídos.
+- **Sanity checks:** variação antes/depois, offsets DC em µV, amplitudes pico a pico,
+  contribuição de cada canal para rejeições, potência estreita de 50/60 Hz e alertas de
+  variação relativa (<0,2× ou >5× a mediana dos canais). Alertas não excluem automaticamente.
+- **Raw:** snapshot de 12 s no meio do bloco; antes em cinza e depois em azul, sobrepostos
+  por canal. A mediana de cada traço é removida **apenas para exibição**. O eixo continua em µV.
+  A faixa inicial de exibição usa P99,5; extremos podem ficar fora do enquadramento e podem
+  ser examinados ajustando o eixo interativo. Os valores completos ficam nas tabelas de QC.
+- **ERP:** uma figura por classe, subplots por canal, média dos trials em linha forte e
+  ±1 desvio-padrão em faixa clara. Escalas por canal, identificadas em µV; não se colorizam canais.
+- **Espectrograma:** C3/Cz/C4 separadamente, escala comum em dB (µV²/Hz), paleta cividis.
+- **ERD/ERS:** mu/beta por C3/Cz/C4 e classe, média ± DP, tempo–frequência por canal e
+  topografias com escala comum. Negativo = redução; positivo = aumento de potência.
+- **Classificação:** matriz de confusão, scores externos, timeline contínua de teste,
+  curvas por época com alpha crescente por cronologia e média destacada.
+- **Detalhes:** PCA 2D/3D, cada época antes/depois, motivos de rejeição, configuração,
+  versões e hashes dos arquivos. Épocas rejeitadas também podem ser inspecionadas.
 
-Saídas: `diagnostics.html`, `diagnostics.csv`, `diagnostics.json` e um JSON por registro.
-Cada item informa etapa, `ok`/`warning`/`error`, mensagem e ação recomendada. O JSON contém
-configuração, QC, durações das fases e rejeições. O diagnóstico é salvo por registro, mesmo
-que outros registros falhem; arquivos ausentes também aparecem. Apenas registros incluídos
-pelos filtros e controle são verificados. O check é executado automaticamente antes do batch.
-Falhas posteriores da análise geram também `error_traceback.txt` no diretório do registro.
+Paleta de classes: Okabe–Ito com azul/laranja/verde/roxo/cinza; mapas sequenciais em cividis
+ou cinza, mapas divergentes em azul/vermelho. Cores de classes são consistentes nas figuras.
 
-Marcadores ligeiramente anteriores/posteriores ao EEG não bloqueiam o bloco inteiro:
-seus tempos originais são preservados e a distância às bordas é registrada. Trials precisam
-ter ATTEMPT dentro do sinal; épocas sem EEG suficiente são rejeitadas pelo MNE. Na classificação,
-o segmento é limitado às amostras disponíveis. Se nenhum marcador sobrepõe o EEG, a leitura
-continua bloqueada para investigar sincronização.
+## Baseline e pré-processamento
 
-Quando a baseline não cai em PAUSA, o check procura um intervalo comum nas PAUSAs anteriores
-com margem de 250 ms e duração mínima de 500 ms, e registra `suggested_erd_config` quando possível.
-A sugestão inclui ampliar o contexto pré-ATTEMPT; **não é aplicada automaticamente**. Revise-a
-em uma cópia do JSON e execute novamente o check. O primeiro trial pode continuar sem baseline.
-Um check `ok` não certifica ausência de artefatos nem substitui inspeção ou ajuste numérico do modelo.
+Confirme `scale_to_volts`: o padrão `1e-6` presume CSVs em **µV**, como no notebook.
+Se já forem volts, use `1.0`. Canal e unidade não são inferidos pela amplitude.
 
-## Eletrofisiologia
+MNE: filtro FIR offline 0,5–45 Hz, notch opcional, referência média configurável,
+rejeição por pico a pico/flatness. Não há ICA automático ou garantia de remover todos os artefatos.
+Canais ruins são excluídos, sem interpolação. Montagem padronizada `colin27_1020`, com
+nome legado equivalente `standard_1020` para MNE antigo; não é digitalização individual.
 
-- Sanity checks: finitude, monotonicidade, amostragem/jitter/gaps/drift, limites dos marcadores,
-  reconstrução das fases, canais ruins, amplitude, desvio-padrão e fração de passos constantes.
-  Por padrão, irregularidades pequenas dos timestamps são tratadas ajustando um relógio
-  uniforme à ordem original das linhas (sem excluir, ordenar ou interpolar amostras EEG).
-  Isso pressupõe que as linhas preservam a ordem de aquisição e que não houve perda de amostras.
-  Timestamps duplicados podem ocorrer em gravação por chunks; apenas timestamps não permitem
-  provar se houve perda de dados. O sanity check registra repetições, reversões, taxa estimada
-  e o maior ajuste. Não se imputam NaNs.
-  `timestamp_policy="strict"` mantém a recusa anterior. No modo padrão `sample_clock`,
-  correções maiores que `max_timestamp_correction_s=0.1` s são recusadas para investigar
-  gaps/reinícios de relógio. Esse limite é uma tolerância configurável, não uma garantia de
-  precisão dos eventos. A reconstrução pode alterar o alinhamento de eventos dentro desse
-  limite; confira o diagnóstico antes de interpretar ERP ou timing fino.
-- Pré-processamento MNE: notch opcional, filtro FIR offline 0,5–45 Hz, referência média configurável.
-  A referência usa canais bons; os canais marcados ruins são excluídos, sem interpolação.
-  A escolha de 0,5 Hz preserva mais informação para inspeção de ERP do que 5 Hz no notebook,
-  embora ainda possa alterar componentes lentos. Não há ICA automático ou alegação de remover todo artefato.
-- Épocas alinhadas ao **ATTEMPT**, de −3,5 a +5,25 s, rejeição por pico a pico/flatness,
-  sinal bruto antes/depois, imagens de épocas por canal e ERP de todos os canais no mesmo eixo.
-  A cor identifica classe; canais não recebem cores arbitrárias.
-- Welch por classe no intervalo ativo; espectrograma contínuo; Morlet por trial para ERD/ERS,
-  com baseline individual antes da média. Os gráficos de banda mostram a média das variações
-  relativas por frequência/canal, não a média do sinal antes de calcular potência.
-- ERD negativo = redução de potência; ERS positivo = aumento. Topografias mu [8,13) e beta
-  [13,30) Hz usam o mesmo limite simétrico entre classes/bandas. A grade padrão é de 2 Hz;
-  os limites incluem as frequências disponíveis nesse intervalo, não integração espectral contínua.
-- PCA 2D/3D sobre covariâncias OAS → espaço tangente → padronização, uma observação por trial.
-  É exploratório, ajustado no conjunto visualizado, e não fornece desempenho de generalização.
+Por padrão `erd_baseline_mode="preceding_pause"`: para cada trial procura-se até 1,5 s
+na PAUSA anterior, com margens de 250 ms e mínimo de 500 ms. O contexto necessário é lido
+do EEG contínuo, verificado por amplitude/flatness, e a normalização é feita por trial antes
+da média. `baseline_audit.csv` registra intervalos e exclusões. O primeiro trial geralmente
+não tem referência válida. Se nenhum trial servir, o relatório explica a ausência de ERD.
+`erd_baseline_mode="fixed"` usa o intervalo `baseline` relativo ao ATTEMPT, exigindo que esteja
+em PAUSA. O ERP sempre usa `baseline`; é um check descritivo, sem alegação de resposta evocada.
+`active` controla o intervalo de PSD/PCA/topografias. Topomapas usam interpolação linear local
+sobre cobertura sensorimotora limitada. Mu é [8,13) Hz e beta [13,30) Hz na grade TFR configurada.
 
-**Baseline:** `baseline` é relativa ao ATTEMPT e precisa caber inteiramente em uma PAUSA
-anterior conhecida para entrar no ERD/ERS. O primeiro trial geralmente não atende a isso.
-O relatório salva `baseline_audit.csv`; se nenhum trial atender, ERD/TFR/topografias ficam
-indisponíveis, com explicação. Não se substitui PAUSA por ATTENTION silenciosamente.
-A baseline do ERP continua sendo o intervalo configurado, mesmo quando não é uma PAUSA,
-pois o ERP é apenas um check descritivo. `active` é o intervalo usado em PSD, PCA e topografias.
+## Validação dos classificadores
 
-## Classificação e escolha de parâmetros
-
-Pipeline principal: **Covariância OAS → TangentSpace Riemann → StandardScaler → SVM RBF**.
-Banco de bandas concatena features tangentes de cada banda. Para experimentar CSP+SVM,
-use `"pipelines": ["tgsp", "csp"]` no JSON; o CSP também é ajustado só nos folds de treino.
-`config.json` define janelas, offsets, passo, bandas, C, gamma, folds e orçamento de busca.
-Um JSON parcial passado com `--config` substitui apenas os campos fornecidos. Exemplo:
+TGSP: OAS → espaço tangente Riemann → StandardScaler → SVM RBF.
+Alternativa: CSP com regularização OAS → StandardScaler → SVM RBF.
+Banco de bandas concatena features por banda. Janelas, offsets, bandas, C e gamma são configuráveis.
+Um JSON parcial passado com `--config` altera só os campos fornecidos:
 
 ```json
 {
   "windows": [1.0, 1.5, 2.0],
   "offsets": [0.0, 0.5, 1.0],
   "bands": [[[5, 35]], [[8, 13], [13, 30]]],
-  "pipelines": ["tgsp", "csp"],
   "svm_c": [0.1, 1.0, 10.0],
-  "svm_gamma": ["scale", 0.01],
-  "search_budget": 24
+  "search_budget": 24,
+  "curve_smoothing_s": 0.6
 }
 ```
 
-O offset é aplicado ao início de cada fase usada; as janelas nunca ultrapassam a fase.
-A duração de cada fase é limitada a `attempt_duration` para uma PAUSA longa não dominar
-o treino. O filtro do classificador é Butterworth causal de ordem 4, por trial isolado,
-com notch causal opcional e referência configurada. Usa-se o sinal bruto, sem reutilizar
-o FIR contínuo offline. Isso evita mistura de amostras de trials de teste no filtro do treino.
-Não há decimação por slicing; mantém-se a taxa original, evitando aliasing.
-Filtros, referência e calibração diferem potencialmente do sistema online de coleta:
-estas análises não são uma reprodução garantida do classificador implantado.
+O trial inteiro é separado entre treino/teste, com estratificação pela condição original.
+A busca é aninhada; features, scaler e calibração sigmoid são ajustados no treino.
+A BA/matriz final usa probabilidades médias por trial/fase; BA por janela é registrada separadamente.
+A busca interna usa votos por trial/fase. Candidatos sem suporte temporal/classes/CV são descartados
+antes de calcular a interseção de unidades entre candidatos. Poucos trials geram impedimento explícito.
 
-A unidade de separação é o **trial inteiro**. Todas as janelas/fases de um trial ficam
-do mesmo lado de cada divisão, com estratificação pela condição original do trial.
-A busca é aninhada: parâmetros escolhidos no CV interno, desempenho no teste externo.
-O scaler, espaço tangente, CSP e calibração sigmoid são ajustados dentro dos folds.
-As probabilidades usam `CalibratedClassifierCV` com divisões por trial; não se usa a
-calibração interna padrão do SVM sobre janelas sobrepostas. Poucos trials causam um
-impedimento explícito, nunca uma troca silenciosa para CV por janelas.
+O classificador usa Butterworth causal ordem 4 por trial, notch opcional e referência configurada,
+sem reutilizar o FIR offline entre trials. A timeline usa o modelo do fold em que o trial ficou
+no teste. Janelas atravessam as fases dentro do trial para mostrar o contexto STIMULUS e transições,
+mas nenhuma janela atravessa a fronteira entre trials. Trials de condições fora do protocolo
+(ex. REST_STIM em LEFT×RIGHT), que não entram no treino, recebem predição de um fold designado
+somente como contexto (`context_only`); não entram nas métricas. Não há predição para trechos sem suporte
+nem para trials rejeitados. Isso pode deixar lacunas reais entre trials.
 
-A busca interna usa BA de votos por trial/fase. A BA final e a matriz de confusão usam
-probabilidades médias por trial/fase; BA por janela é salva separadamente. Assim uma
-fase longa não pesa como vários trials independentes. A mesma interseção de unidades
-trial/classe é usada para comparar candidatos viáveis. O JSON registra os candidatos
-inválidos, scores internos, parâmetros escolhidos e IDs de treino/teste de cada fold.
-Os scores internos **não** são desempenho independente de cada candidato.
+As curvas de épocas são extraídas dessa timeline; a média usa interpolação linear apenas dentro
+do suporte de cada trial. Não se extrapola para preencher bordas; o hover informa quantos trials
+contribuem em cada tempo. `curve_smoothing_s` aplica média móvel **causal por trial/fold**, apenas
+à visualização. Probabilidades e métricas exportadas permanecem sem suavização. A janela é
+posicionada em seu fim; suavização e duração da janela introduzem atraso visual.
 
-Protocolos preservados:
+Online: somente IM_treino incluído, do mesmo sujeito e estritamente anterior; por padrão o mais
+recente da mesma sessão. `train_run_id` pode indicar outro anterior. Sempre é identificado como
+**proxy**, não como reprodução garantida do modelo usado na coleta. Tendências visuais não provam aprendizado.
 
-| Protocolo | Classes/fases |
-| --- | --- |
-| `left_right` | LEFT × RIGHT durante ATTEMPT |
-| `rest_move` | PAUSA/REST × ATTEMPT de LEFT/RIGHT/BOTH; inclui REST após REST_STIM |
-| `attention_move` | ATTENTION × ATTEMPT de LEFT/RIGHT/BOTH |
-| `reststim_move` | REST_STIM × ATTEMPT de LEFT/RIGHT/BOTH |
-| `rest_left_right` | LEFT × RIGHT × REST; usa REST_STIM se existir, senão PAUSA |
+Protocolos: `left_right`, `rest_move`, `attention_move`, `reststim_move`, `rest_left_right`.
+REST é PAUSA; REST_STIM é condição de ATTEMPT. No multiclasses, a fonte de REST é registrada.
+Online sem identificação e o valor legado `online_definir` entram como `online_com_feedback`.
 
-A fonte da terceira classe fica registrada em `rest_source`: REST_STIM e PAUSA não são
-fisiologicamente equivalentes. Protocolos com classes ausentes são declarados indisponíveis.
+## Dados, controle e diagnóstico
 
-Nos blocos online, usa-se apenas IM_treino incluído, do mesmo sujeito, **estritamente anterior**.
-Sem indicação manual, busca-se o mais recente da mesma sessão. Outro registro anterior
-do mesmo sujeito pode ser indicado por `train_run_id`. A busca de parâmetros e calibração
-ocorre apenas nesse treino; o bloco online fica reservado ao teste. A origem é sempre
-declarada **proxy**, pois o notebook não contém a calibração real usada na coleta.
+Organização típica: `dados/AB01/S1/IM_treino/..._signal_<timestamp>.csv` e par `_markers_`.
+Sinal: `lsl_time_s`, `ch1`…`ch15`. Marcadores: `lsl_time_s`, `label`. Mapa preservado do notebook:
+FC3, FCz, C5, C3, FC4, C1, CP3, Cz, C2, C4, CP1, CPz, CP4, CP2, C6.
 
-Curvas mostram somente predições de teste (ou teste online proxy), posicionadas no **fim
-da janela causal**. Trials antigos têm alpha menor e recentes, maior; a média recebe linha
-mais forte. Não há suavização centrada, extrapolação, normalização da duração do trial
-ou interpolação através de fases sem amostras. Quando folds escolhem janelas diferentes,
-a média usa os tempos de fim efetivamente coincidentes; suporte pode variar ao longo da curva.
-Uma tendência visual não constitui evidência causal de aprendizado.
+No `dataset_index.csv`: `include`, `block_type`, `group`, `bad_channels` (ex. `C3,CPz`),
+`exclude_trials` (IDs a partir de zero, ex. `0,3,8`), `reason` e `train_run_id` são editáveis.
+Atualizar índice preserva decisões; novos registros começam excluídos. Caminhos são relativos
+à raiz. O grupo é metadado; não gera inferência estatística automática.
 
-## Saídas e reprodutibilidade
+O check salva `diagnostics.html/csv/json`, mesmo com arquivos ausentes, e o batch conserva
+`error_traceback.txt` se falhar depois. Timestamps pequenos repetidos/reversos podem ser
+reconstruídos sob hipótese de ordem de aquisição e taxa uniforme, preservando amostras;
+limite padrão de ajuste: 100 ms. O ajuste é auditado e não garante sincronização. Use
+`timestamp_policy="strict"` para recusar irregularidades. Marcadores nas bordas são registrados,
+sem deslocamento; épocas incompletas são descartadas. Relógios sem sobreposição continuam bloqueados.
 
-Cada execução contém `index.html` (agregador), `selected_control.csv`, `summary.csv` e
-`batch_results.json`. Cada registro tem um dashboard em uma única imagem, imagens/PDFs,
-`report.html` autocontido, tabelas de trials/rejeição/baseline, parâmetros, métricas e
-predições por janela. A configuração, versões das bibliotecas, linha de controle e
-hashes SHA-256 dos dois CSVs ficam em `parameters_qc.json`.
+Cada execução tem pasta própria, `index.html`, `comparison.html`, CSVs e JSONs. Por registro:
+`report.html` autocontido, PNG 300 dpi/PDF, `parameters_qc.json`, `channel_quality.csv`,
+`trials.csv`, `epoch_audit.csv`, `baseline_audit.csv`, `erd_metrics.csv`, métricas e predições.
+`*_timeline.csv` guarda probabilidades não suavizadas do contexto de teste.
 
-O dashboard resume raw, ERP, espectro, ERD/ERS, topografias mu/beta de LEFT/RIGHT quando
-disponíveis, PCA e classificação; as demais classes/protocolos ficam nas figuras completas.
-Os relatórios detalhados mostram também o sinal processado de épocas rejeitadas.
-Épocas sem contexto suficiente nas bordas são registradas como rejeitadas, sem padding.
-Não se juntam sessões com canais/taxas diferentes em um único modelo, nem se atribui
-significância a centenas de janelas dependentes. Comparações entre sujeitos exigem
-definir desenho experimental e unidade estatística antes de um teste inferencial.
-
-Testes de regressão, usando apenas CSVs sintéticos:
-
-```bash
-python -m pip install pytest
-python -m pytest -q
-```
-
-Os testes verificam reconstrução de fases, preservação de exclusões, reconstrução de timestamps repetidos, recusa de reinícios de relógio
-e modo estrito e isolamento de trials no CV, além da interface e geração de relatórios.
-**Ainda é necessário validar uma gravação real**: unidade física, mapa dos eletrodos,
-tempos efetivos do protocolo, baseline, referência e limiares de rejeição.
+Testes: `python -m pip install pytest && python -m pytest -q`. São testes com dados sintéticos;
+valide unidades, mapa dos canais, protocolo e limiares em suas gravações reais.
