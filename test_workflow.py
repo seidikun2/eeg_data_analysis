@@ -99,8 +99,18 @@ def test_irregular_timestamps_fail(tmp_path):
     frame                       = pd.read_csv(path)
     frame.loc[10, "lsl_time_s"] = frame.loc[9, "lsl_time_s"]
     frame.to_csv(path, index=False)
+    cfg = quick_config()
+    cfg["timestamp_policy"] = "strict"
     with pytest.raises(ValueError, match="duplicados"):
-        load_run(tmp_path, row, quick_config())
+        load_run(tmp_path, row, cfg)
+    cfg["timestamp_policy"] = "sample_clock"
+    with pytest.warns(RuntimeWarning, match="reconstruído"):
+        run = load_run(tmp_path, row, cfg)
+    assert run.qc["timing"]["duplicate_intervals"] == 1
+    assert run.raw.n_times == len(frame)
+    assert np.all(np.diff(run.times) > 0)
+    assert np.allclose(run.raw.get_data()[0], frame.ch1 * cfg["scale_to_volts"])
+
 
 
 @pytest.mark.parametrize("pipeline", ["tgsp", "csp"])
@@ -146,3 +156,37 @@ def test_online_requires_prior_included_calibration(tmp_path):
     online["stamp"] = "20260101_110000"
     with pytest.raises(ValueError, match="anterior"):
         calibration_row(online, included)
+
+
+def test_clock_reset_refused():
+    from eeg import sample_clock
+    times = np.arange(2000) / 128
+    times[1000:] -= 2
+    with pytest.raises(ValueError, match="Relógio inconsistente"):
+        sample_clock(times, quick_config())
+
+
+def test_legacy_online_is_feedback(tmp_path):
+    control = synthetic(tmp_path, n=4)
+    frame = pd.read_csv(control)
+    frame["block_type"] = "online_definir"
+    frame.to_csv(control, index=False)
+    assert selection(control).block_type.eq("online_com_feedback").all()
+    assert scan(tmp_path, control).block_type.eq("online_com_feedback").all()
+
+
+@pytest.mark.parametrize("chunks", [False, True])
+def test_clock_chunks_and_small_reversal(chunks):
+    from eeg import sample_clock
+    expected = np.arange(1280) / 128 + 1000
+    times = expected.copy()
+    if chunks:
+        times = expected[(np.arange(len(times)) // 8) * 8]
+    else:
+        times[50] = times[48]
+    with pytest.warns(RuntimeWarning, match="reconstruído"):
+        corrected, qc = sample_clock(times, quick_config())
+    assert len(corrected) == len(times)
+    assert np.all(np.diff(corrected) > 0)
+    assert qc["sfreq"] == pytest.approx(128, rel=0.001)
+    assert qc["max_correction_s"] < 0.1

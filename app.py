@@ -34,6 +34,7 @@ if not control.exists():
     st.stop()
 frame                                  = pd.read_csv(control, keep_default_na=False)
 frame["include"]                       = truth(frame.include)
+frame["block_type"]                    = frame.block_type.replace("online_definir", "online_com_feedback")
 for column in ["bad_channels", "exclude_trials", "reason", "train_run_id"]:
     if column not in frame:
         frame[column] = ""
