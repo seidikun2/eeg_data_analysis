@@ -236,3 +236,13 @@ def test_infeasible_long_window_does_not_poison_short_candidate(tmp_path):
     assert len(data) == 1 and len(errors) == 1
     assert data[0][0]['window'] == 1.0
     assert data[0][2].trial.nunique() == 16
+
+
+def test_legacy_mne_montage_name(tmp_path, monkeypatch):
+    import mne
+    control = synthetic(tmp_path, n=4)
+    monkeypatch.setattr(mne.channels, 'get_builtin_montages', lambda **kwargs: ['standard_1020'])
+    run = load_run(tmp_path, selection(control).iloc[0], quick_config())
+    assert run.qc['montage'] == 'standard_1020'
+    assert all(channel['loc'][:3].any() for channel in run.raw.info['chs'])
+    assert len(make_epochs(run, quick_config())[1]) == 4

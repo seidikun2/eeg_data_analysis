@@ -61,7 +61,7 @@ def raw_figure(run, cfg):
 def erp_plot(ax, epochs, cfg):
     times = epochs.times
     for cls in epochs.event_id:
-        values = epochs[cls].get_data(picks="eeg", exclude="bads") * 1e6
+        values = epochs[cls].get_data(picks=mne.pick_types(epochs.info, eeg=True, exclude="bads")) * 1e6
         values = values - values[:, :, (times >= cfg["baseline"][0]) & (times <= cfg["baseline"][1])].mean(axis=-1, keepdims=True)
         mean   = values.mean(axis=0)
         ax.plot(times, mean.T, color=COLORS[cls], alpha=0.35, lw=0.6)
@@ -182,7 +182,7 @@ def epoch_figure(epochs):
 
 
 def pca_figure(epochs, cfg):
-    data = epochs.copy().crop(*cfg["active"]).get_data(picks="eeg", exclude="bads")
+    data = epochs.copy().crop(*cfg["active"]).get_data(picks=mne.pick_types(epochs.info, eeg=True, exclude="bads"))
     Z    = TangentSpace(metric="riemann").fit_transform(Covariances(estimator="oas").fit_transform(data))
     Z    = StandardScaler().fit_transform(Z)
     n    = min(3, *Z.shape)
@@ -384,7 +384,7 @@ def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocol
                                         vlim=(-limit, limit), contours=0, image_interp="linear", extrapolate="local")
             ax.set_title(f"{cls} · {band}", color=COLORS[cls])
         fig.colorbar(im, ax=list(axes[1]), label="ERD/ERS (%) · mesma escala; todas as classes no relatório")
-    values   = epochs.copy().crop(*cfg["active"]).get_data(picks="eeg", exclude="bads")
+    values   = epochs.copy().crop(*cfg["active"]).get_data(picks=mne.pick_types(epochs.info, eeg=True, exclude="bads"))
     features = TangentSpace(metric="riemann").fit_transform(Covariances(estimator="oas").fit_transform(values))
     pos      = PCA(n_components=2).fit_transform(StandardScaler().fit_transform(features))
     for cls in epochs.event_id:
@@ -443,7 +443,9 @@ def diagnose_run(root, row, cfg, protocols=None):
     """Pré-checagem sem treinar modelos; preserva todas as causas verificáveis por etapa."""
     checks = []
     result = dict(run_id=row.run_id, subject=row.subject, session=row.session,
-                  block_type=row.block_type, config=cfg, checks=checks)
+                  block_type=row.block_type, config=cfg,
+                  versions={p: importlib.metadata.version(p) for p in ["mne", "numpy", "scipy", "scikit-learn", "pyriemann"]},
+                  checks=checks)
 
     def add(stage, status, message, action=""):
         checks.append(dict(stage=stage, status=status, message=message, action=action))

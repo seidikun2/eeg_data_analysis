@@ -44,7 +44,10 @@ dados/AB01/S1/IM_treino/..._markers_20260101_120000.csv
 O sinal requer `lsl_time_s`, `ch1` até `ch15`; os marcadores requerem `lsl_time_s`, `label`.
 O par deve diferir apenas por `_signal_` / `_markers_`. O mapa de canais é o mesmo do notebook:
 FC3, FCz, C5, C3, FC4, C1, CP3, Cz, C2, C4, CP1, CPz, CP4, CP2, C6.
-Usa-se a montagem MNE `colin27_1020`, com posições padronizadas, não digitalização individual.
+Usa-se a montagem MNE `colin27_1020`, ou seu nome legado equivalente `standard_1020`
+quando o primeiro não existe na versão instalada. São posições padronizadas, não digitalização
+individual. O QC registra a montagem escolhida e o diagnóstico inclui as versões das bibliotecas,
+mesmo quando o pré-processamento falha.
 Os topomapas usam interpolação linear local sobre uma cobertura sensorimotora limitada,
 evitando extrapolar para todo o escalpo ou introduzir extremos por interpolação cúbica.
 

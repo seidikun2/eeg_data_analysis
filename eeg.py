@@ -253,7 +253,9 @@ def load_run(root, row, cfg):
         warnings.warn("Marcadores nas bordas/fora do sinal: registrados no QC, sem deslocar ou recortar timestamps.", RuntimeWarning)
     names = [CHANNEL_MAP.get(c, c.upper()) for c in cols]
     raw   = mne.io.RawArray(data, mne.create_info(names, sfreq, "eeg"), verbose=False)
-    raw.set_montage("colin27_1020", on_missing="raise", verbose=False)
+    available = mne.channels.get_builtin_montages()
+    montage   = "colin27_1020" if "colin27_1020" in available else "standard_1020"
+    raw.set_montage(montage, on_missing="raise", verbose=False)
     bads = [v.strip() for v in str(row.get("bad_channels", "")).split(",") if v.strip()]
     if set(bads) - set(names):
         raise ValueError(f"Canais ruins desconhecidos: {set(bads) - set(names)}")
@@ -277,7 +279,7 @@ def load_run(root, row, cfg):
     trials["valid"] &= ~trials.manual_exclusion
     trials["valid"] &= trials.attempt_start.between(times[0], times[-1])
     qc = dict(sfreq=sfreq, n_samples=len(times), duration_s=float(times[-1] - times[0]),
-              jitter_p99=jitter, timestamp_drift_s=drift, timing=timing, marker_bounds=marker_bounds, channels=names, bad_channels=bads,
+              jitter_p99=jitter, timestamp_drift_s=drift, timing=timing, montage=montage, marker_bounds=marker_bounds, channels=names, bad_channels=bads,
               peak_to_peak_uv=dict(zip(names, np.ptp(data, axis=1) * 1e6)),
               std_uv=dict(zip(names, np.std(data, axis=1) * 1e6)),
               flat_step_fraction=dict(zip(names, np.mean(np.abs(np.diff(data, axis=1)) < 1e-12, axis=1))),
