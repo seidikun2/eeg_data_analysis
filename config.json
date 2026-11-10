@@ -7,6 +7,8 @@
   "reject_uv": 150.0,
   "flat_uv": 0.1,
   "jitter_tolerance": 0.05,
+  "timestamp_policy": "sample_clock",
+  "max_timestamp_correction_s": 0.1,
   "attempt_duration": 3.75,
   "epoch_tmin": -3.5,
   "epoch_tmax": 5.25,

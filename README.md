@@ -64,7 +64,8 @@ precisam compartilhar o relógio LSL e estar em segundos.
 | `reason` | Justificativa manual, registrada no relatório |
 | `train_run_id` | Opcional: registro IM anterior usado como calibração proxy para online |
 
-Online sem identificação de feedback fica como `online_definir` e não entra na análise.
+Online sem identificação de feedback é tratado como `online_com_feedback`.
+O valor legado `online_definir` também é convertido ao ler ou atualizar a tabela, preservando `include`.
 Sujeito/sessão são inferidos como no notebook (`AB01`, `S1`); revise `UNKNOWN` na tabela
 se a organização de pastas for diferente. Caminhos novos são relativos à pasta dos dados,
 permitindo movê-la entre máquinas. Atualizar o índice preserva decisões manuais, mantém
@@ -92,7 +93,17 @@ os resultados bem-sucedidos são preservados e o motivo consta no HTML/JSON.
 
 - Sanity checks: finitude, monotonicidade, amostragem/jitter/gaps/drift, limites dos marcadores,
   reconstrução das fases, canais ruins, amplitude, desvio-padrão e fração de passos constantes.
-  Amostragem irregular é recusada; não se assume um sinal uniforme sobre gaps nem se imputam NaNs.
+  Por padrão, irregularidades pequenas dos timestamps são tratadas ajustando um relógio
+  uniforme à ordem original das linhas (sem excluir, ordenar ou interpolar amostras EEG).
+  Isso pressupõe que as linhas preservam a ordem de aquisição e que não houve perda de amostras.
+  Timestamps duplicados podem ocorrer em gravação por chunks; apenas timestamps não permitem
+  provar se houve perda de dados. O sanity check registra repetições, reversões, taxa estimada
+  e o maior ajuste. Não se imputam NaNs.
+  `timestamp_policy="strict"` mantém a recusa anterior. No modo padrão `sample_clock`,
+  correções maiores que `max_timestamp_correction_s=0.1` s são recusadas para investigar
+  gaps/reinícios de relógio. Esse limite é uma tolerância configurável, não uma garantia de
+  precisão dos eventos. A reconstrução pode alterar o alinhamento de eventos dentro desse
+  limite; confira o diagnóstico antes de interpretar ERP ou timing fino.
 - Pré-processamento MNE: notch opcional, filtro FIR offline 0,5–45 Hz, referência média configurável.
   A referência usa canais bons; os canais marcados ruins são excluídos, sem interpolação.
   A escolha de 0,5 Hz preserva mais informação para inspeção de ERP do que 5 Hz no notebook,
@@ -209,7 +220,7 @@ python -m pip install pytest
 python -m pytest -q
 ```
 
-Os testes verificam reconstrução de fases, preservação de exclusões, recusa de timestamps
-inválidos e isolamento de trials no CV, além da interface e geração de relatórios.
+Os testes verificam reconstrução de fases, preservação de exclusões, reconstrução de timestamps repetidos, recusa de reinícios de relógio
+e modo estrito e isolamento de trials no CV, além da interface e geração de relatórios.
 **Ainda é necessário validar uma gravação real**: unidade física, mapa dos eletrodos,
 tempos efetivos do protocolo, baseline, referência e limiares de rejeição.

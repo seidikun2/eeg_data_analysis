@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -106,6 +107,7 @@ def scan(root, control):
         if len(missing):
             missing["available"] = False
             current              = pd.concat([current, missing], ignore_index=True)
+    current["block_type"] = current.block_type.replace("online_definir", "online_com_feedback")
     current["include"] = truth(current.include)
     current            = current.sort_values(["subject", "session", "stamp"]).reset_index(drop=True)
     control.parent.mkdir(parents=True, exist_ok=True)
@@ -117,6 +119,7 @@ def selection(control, subjects=None, sessions=None, blocks=None, runs=None):
     frame = pd.read_csv(control, keep_default_na=False)
     if frame.run_id.duplicated().any() or frame.run_id.astype(str).str.contains(r"[/\\]").any():
         raise ValueError("run_id deve ser único e não conter separadores de caminho.")
+    frame["block_type"] = frame.block_type.replace("online_definir", "online_com_feedback")
     frame = frame[truth(frame.include) & frame.block_type.isin(BLOCKS)].copy()
     for column, values in [("subject", subjects), ("session", sessions), ("block_type", blocks), ("run_id", runs)]:
         if values:
@@ -162,6 +165,53 @@ def trials_from_markers(markers, signal_end, duration):
     return frame
 
 
+def sample_clock(times, cfg):
+    """Preserva as linhas EEG; ajusta somente o relógio sob hipótese de aquisição uniforme."""
+    delta = np.diff(times)
+    positive = delta[delta > 0]
+    if not len(positive):
+        raise ValueError("Sem progressão temporal para estimar a taxa de amostragem.")
+    dt = float(np.median(positive))
+    jitter = float(np.quantile(np.abs(delta / dt - 1), 0.99))
+    drift  = float(np.max(np.abs(times - (times[0] + np.arange(len(times)) * dt))))
+    irregular = bool(np.any(delta <= 0) or jitter > cfg["jitter_tolerance"]
+                     or np.max(delta) > 1.5 * dt or drift > 2 * dt)
+    mode = cfg["timestamp_policy"]
+    if mode not in {"sample_clock", "strict"}:
+        raise ValueError("timestamp_policy deve ser sample_clock ou strict.")
+    if irregular and mode == "strict":
+        raise ValueError("Timestamps do sinal duplicados ou fora de ordem, ou amostragem irregular (modo strict).")
+    corrected = times.copy()
+    if irregular:
+        # Ajuste centrado evita perda de precisão em timestamps LSL grandes.
+        x = np.arange(len(times), dtype=float)
+        y = times - times[0]
+        keep = np.ones(len(times), dtype=bool)
+        for _ in range(4):
+            slope, intercept = np.polyfit(x[keep], y[keep], 1)
+            residual = y - (intercept + slope * x)
+            center = np.median(residual)
+            mad = 1.4826 * np.median(np.abs(residual - center))
+            keep = np.abs(residual - center) <= max(4 * mad, 2 * abs(slope))
+            if keep.sum() < 10:
+                raise ValueError("Suporte insuficiente para reconstruir relógio de amostragem.")
+        corrected = times[0] + intercept + slope * x
+        correction = float(np.max(np.abs(corrected - times)))
+        if slope <= 0 or correction > cfg["max_timestamp_correction_s"]:
+            raise ValueError(f"Relógio inconsistente: ajuste máximo {correction:.4f}s. "
+                             "Conferir gaps, reinício do relógio ou ordem real das amostras; não reordenar EEG automaticamente.")
+        dt = float(slope)
+        warnings.warn(f"Relógio EEG reconstruído sem remover/reordenar amostras: "
+                      f"{sum(delta == 0)} intervalos repetidos, {sum(delta < 0)} reversões; "
+                      f"ajuste máximo {correction:.6f}s. Conferir timing no relatório.", RuntimeWarning)
+    timing = dict(sfreq=1 / dt, policy=mode, reconstructed=irregular,
+                  duplicate_intervals=int(sum(delta == 0)), reversed_intervals=int(sum(delta < 0)),
+                  max_correction_s=float(np.max(np.abs(corrected - times))),
+                  jitter_p99=jitter, timestamp_drift_s=drift,
+                  assumption="Ordem das linhas representa ordem de aquisição; taxa uniforme; sem perda de amostras.")
+    return corrected, timing
+
+
 @dataclass
 class Run:
     row: pd.Series
@@ -184,15 +234,10 @@ def load_run(root, row, cfg):
     data  = signal[cols].to_numpy(float).T * cfg["scale_to_volts"]
     if len(times) < 10 or not np.isfinite(data).all() or not np.isfinite(times).all():
         raise ValueError("Sinal curto ou valores NaN/Inf: corrigir o arquivo, sem imputação silenciosa.")
-    delta = np.diff(times)
-    if np.any(delta <= 0):
-        raise ValueError("Timestamps do sinal duplicados ou fora de ordem.")
-    dt     = float(np.median(delta))
-    sfreq  = 1 / dt
-    jitter = float(np.quantile(np.abs(delta / dt - 1), 0.99))
-    drift  = float(np.max(np.abs(times - (times[0] + np.arange(len(times)) * dt))))
-    if jitter > cfg["jitter_tolerance"] or np.max(delta) > 1.5 * dt or drift > 2 * dt:
-        raise ValueError(f"Amostragem irregular: jitter p99={jitter:.3f}, gap={max(delta):.4f}s, drift={drift:.4f}s. Reamostrar explicitamente antes de analisar.")
+    times, timing = sample_clock(times, cfg)
+    sfreq = timing["sfreq"]
+    jitter = timing["jitter_p99"]
+    drift  = timing["timestamp_drift_s"]
     if cfg["h_freq"] >= sfreq / 2:
         raise ValueError("h_freq precisa ser menor que Nyquist.")
     if not np.isfinite(markers.lsl_time_s.to_numpy(float)).all():
@@ -226,7 +271,7 @@ def load_run(root, row, cfg):
     trials["valid"] &= ~trials.manual_exclusion
     trials["valid"] &= trials.attention_start >= times[0]
     qc = dict(sfreq=sfreq, n_samples=len(times), duration_s=float(times[-1] - times[0]),
-              jitter_p99=jitter, timestamp_drift_s=drift, channels=names, bad_channels=bads,
+              jitter_p99=jitter, timestamp_drift_s=drift, timing=timing, channels=names, bad_channels=bads,
               peak_to_peak_uv=dict(zip(names, np.ptp(data, axis=1) * 1e6)),
               std_uv=dict(zip(names, np.std(data, axis=1) * 1e6)),
               flat_step_fraction=dict(zip(names, np.mean(np.abs(np.diff(data, axis=1)) < 1e-12, axis=1))),
