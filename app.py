@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from eeg import BLOCKS, PROTOCOLS, save_table, scan, selection, settings, truth
+from eeg import BLOCKS, PROTOCOLS, save_table, scan, selection, settings, truth, project_name
 
 st.set_page_config(page_title="EEG · relatórios", layout="wide")
 st.title("EEG · análise e relatórios")
@@ -40,14 +40,17 @@ frame["block_type"]                    = frame.block_type.replace("online_defini
 for column in ["bad_channels", "exclude_trials", "reason", "train_run_id"]:
     if column not in frame:
         frame[column] = ""
+if "project" not in frame:
+    frame["project"] = frame.signal_path.map(project_name)
+projects=st.sidebar.multiselect("Projetos · vazio = todos",sorted(frame.project.unique()))
+if projects:
+    frame=frame[frame.project.isin(projects)]
 subjects                               = st.sidebar.multiselect("Sujeitos · vazio = todos", sorted(frame.subject.unique()))
 subset                                 = frame[frame.subject.isin(subjects)] if subjects else frame
 sessions                               = st.sidebar.multiselect("Sessões · vazio = todas", sorted(subset.session.unique()))
 blocks                                 = st.sidebar.multiselect("Tipos de bloco · vazio = todos", BLOCKS)
 runs                                   = st.sidebar.multiselect("Registros · vazio = todos", subset.run_id.tolist())
-st.header("1. Selecionar dados e filtros")
-# Containers keep the workflow visible and preserve widget state across reruns.
-tab_control, tab_analysis, tab_results = st.container(), st.container(), st.container()
+tab_control, tab_quality, tab_analysis, tab_results = st.tabs(["Controle dos dados", "Verificar qualidade", "Produzir relatório", "Consultar resultados"])
 with tab_control:
     st.write("Edite inclusão, tipo de bloco, grupo, canais ruins e exclusões. IDs de trials começam em zero.")
     editable = ["include", "group", "block_type", "bad_channels", "exclude_trials", "reason", "train_run_id"]
@@ -65,7 +68,7 @@ with tab_control:
         save_table(saved.reset_index(), control)
         st.success("Decisões salvas em dataset_index.csv.")
 with tab_analysis:
-    st.header("2. Verificar qualidade e 3. Gerar relatório")
+    st.header("Gerar relatório individual, geral e da sessão")
     st.write("Os filtros da barra lateral são aplicados aos registros incluídos na tabela salva. O relatório geral reúne todos os registros selecionados.")
     mode      = st.selectbox("Análises", ["both", "ephys", "classification"],
                         format_func=lambda s: {"both": "Eletrofisiologia + classificação", "ephys": "Eletrofisiologia", "classification": "Classificação"}[s])
@@ -76,6 +79,8 @@ with tab_analysis:
     try:
         cfg = settings(cfg_text or None)
         with st.expander("Ajustar experimento e visualização"):
+            cfg['classifiers']=st.multiselect("Classificadores",['lda','svm_linear','svm_rbf'],default=cfg.get('classifiers',['svm_rbf']))
+            cfg['analysis_decimation']=st.selectbox("Decimação da análise (com antialias causal)",['auto',1,2],index=['auto',1,2].index(cfg.get('analysis_decimation','auto')))
             cfg["windows"] = st.multiselect("Janelas (s)", sorted(set([.5, 1., 1.5, 2., 2.5, 3.] + cfg["windows"])), default=cfg["windows"])
             cfg["offsets"] = st.multiselect("Offsets de treino (s)", sorted(set([0., .25, .5, 1.] + cfg["offsets"])), default=cfg["offsets"])
             bank_options = {json.dumps(v): v for v in ([[[8,30]], [[5,35]], [[8,13],[13,30]]] + cfg["bands"])}
@@ -85,28 +90,36 @@ with tab_analysis:
             cfg["svm_gamma"] = st.multiselect("SVM · gamma", list(dict.fromkeys(["scale", "auto"] + cfg["svm_gamma"])), default=cfg["svm_gamma"])
             cfg["search_budget"] = st.number_input("Máximo de candidatos por busca interna", 1, 200, int(cfg["search_budget"]))
             cfg["curve_smoothing_s"] = st.slider("Suavização visual causal (s)", .1, 2., float(cfg["curve_smoothing_s"]), .1)
-            cfg["erd_baseline_mode"] = st.selectbox("Baseline ERD/ERS", ["preceding_pause", "fixed"], index=0 if cfg["erd_baseline_mode"] == "preceding_pause" else 1,
-                                                     format_func=lambda v: "PAUSA anterior por trial (auditada)" if v == "preceding_pause" else "Intervalo fixo do JSON")
-        if not cfg["windows"] or not cfg["offsets"] or not cfg["bands"] or not cfg["svm_c"]:
+            cfg['erp_baseline_mode']=st.selectbox('Baseline ERP',['attention','fixed'],index=0 if cfg.get('erp_baseline_mode','attention')=='attention' else 1)
+            modes=['attention','preceding_pause','fixed']
+            cfg['erd_baseline_mode']=st.selectbox('Baseline ERD/ERS',modes,index=modes.index(cfg['erd_baseline_mode']),format_func=lambda v:{'attention':'ATTENTION marcado (100 ms de margem)','preceding_pause':'PAUSA anterior por trial','fixed':'Intervalo fixo do JSON em PAUSA'}[v])
+        if not cfg["windows"] or not cfg["offsets"] or not cfg["bands"] or not cfg["svm_c"] or not cfg["svm_gamma"] or not cfg["classifiers"]:
             raise ValueError("Selecione ao menos uma janela, offset, banco de bandas e valor de C.")
 
-        chosen = selection(control, subjects, sessions, blocks, runs)
-        st.write(f"{len(chosen)} registros selecionados.")
+        chosen = selection(control, subjects, sessions, blocks, runs, projects)
+        from analyze import estimate_seconds
+        estimate=estimate_seconds(len(chosen),cfg,mode,protocols,compare)
+        st.write(f"{len(chosen)} registros selecionados. Estimativa inicial: ~{estimate/60:.1f} min (heurística; depende de duração, canais e candidatos).")
         if not chosen.empty:
             st.dataframe(chosen[["run_id", "subject", "session", "block_type"]], hide_index=True)
-        if st.button("Verificar dados antes da análise", disabled=chosen.empty):
-            from analyze import check_dataset
-            output = Path(out_text).expanduser().resolve() / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-            with st.spinner("Verificando arquivos, relógio, marcadores, épocas e viabilidade dos protocolos..."):
-                diagnostics = check_dataset(root, control, output, cfg, subjects, sessions, blocks, runs, protocols)
-            st.write(f"Diagnóstico salvo em {output}")
-            st.dataframe(pd.DataFrame([dict(run_id=r["run_id"], **c) for r in diagnostics for c in r["checks"]]), hide_index=True)
-            st.download_button("Baixar diagnóstico JSON", (output / "diagnostics.json").read_bytes(), "diagnostics.json", "application/json")
+        with tab_quality:
+            st.header("Verificar qualidade")
+            if st.button("Verificar dados antes da análise", disabled=chosen.empty):
+                from analyze import check_dataset
+                output = Path(out_text).expanduser().resolve() / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+                with st.spinner("Verificando arquivos, relógio, marcadores, épocas e viabilidade dos protocolos..."):
+                    diagnostics = check_dataset(root, control, output, cfg, subjects, sessions, blocks, chosen.run_id.tolist(), protocols)
+                st.write(f"Diagnóstico salvo em {output}")
+                st.dataframe(pd.DataFrame([dict(run_id=r["run_id"], **c) for r in diagnostics for c in r["checks"]]), hide_index=True)
+                st.download_button("Baixar diagnóstico JSON", (output / "diagnostics.json").read_bytes(), "diagnostics.json", "application/json")
         if st.button("Gerar relatórios", type="primary", disabled=chosen.empty or (mode != "ephys" and not protocols)):
             from analyze import batch
             output = Path(out_text).expanduser().resolve() / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-            with st.spinner("Processando. Busca aninhada pode demorar; resultados serão gravados por registro."):
-                results = batch(root, control, output, cfg, subjects, sessions, blocks, runs, mode, detailed, protocols, compare)
+            indicator=st.progress(0,text=f'Estimativa inicial ~{estimate/60:.1f} min')
+            def progress(done,total,remaining,name):
+                indicator.progress(done/max(1,total),text=f'{done}/{total} registros · restante estimado ~{remaining/60:.1f} min · {name}')
+            with st.spinner("Processando CV por parâmetros, validação e relatórios..."):
+                results = batch(root, control, output, cfg, subjects, sessions, blocks, runs, mode, detailed, protocols, compare, progress=progress, projects=projects)
             st.session_state["last_output"] = str(output)
             st.success(f"Execução concluída: {output}")
             st.dataframe(pd.DataFrame([{k:v for k,v in r.items() if k != "classification"} for r in results]), hide_index=True)
@@ -126,7 +139,7 @@ with tab_results:
                 st.dataframe(pd.DataFrame([dict(run_id=r["run_id"], **c) for r in diagnostic_rows for c in r["checks"]]), hide_index=True)
                 st.download_button("Baixar diagnóstico completo", (output / "diagnostics.json").read_bytes(), "diagnostics.json", "application/json", key="saved_diagnostics")
         results = json.loads((output / "batch_results.json").read_text()) if (output / "batch_results.json").exists() else []
-        visible = [r for r in results if (not subjects or r["subject"] in subjects)
+        visible = [r for r in results if (not projects or r.get("project","Brasil") in projects) and (not subjects or r["subject"] in subjects)
                    and (not sessions or r["session"] in sessions) and (not blocks or r["block_type"] in blocks)
                    and (not runs or r["run_id"] in runs)]
         if (output / "index.html").exists():
@@ -146,6 +159,13 @@ with tab_results:
                 folder = output / result["run_id"]
                 st.caption("Baixe e abra o HTML no navegador para zoom, inspeção do raw e traçados contínuos. As imagens abaixo são resumos estáticos.")
                 st.image(str(folder / "dashboard.png"))
-                st.download_button("Baixar relatório HTML completo", (folder / "report.html").read_bytes(),
+                session_file=output/f"session_{result.get('project','Brasil')}_{result['subject']}_{result['session']}.html"
+                if session_file.exists():
+                    st.download_button("Baixar relatório da sessão",session_file.read_bytes(),session_file.name,"text/html",key=f"session_{result['run_id']}")
+                st.download_button("Baixar check individual", (folder / "check.html").read_bytes() if (folder / "check.html").exists() else (folder / "report.html").read_bytes(),
                                    file_name=f"{result['run_id']}.html", mime="text/html", key=result["run_id"])
-                st.dataframe(pd.DataFrame(result.get("classification", [])), hide_index=True)
+                table=pd.DataFrame(result.get('classification',[]))
+                if 'balanced_accuracy' in table:
+                    st.dataframe(table.style.background_gradient(cmap='Blues',vmin=0,vmax=1,subset=['balanced_accuracy']),hide_index=True)
+                else:
+                    st.dataframe(table,hide_index=True)

@@ -17,6 +17,13 @@ CHANNEL_MAP = dict(zip(
     [f"ch{i}" for i in range(1, 16)],
     "FC3 FCz C5 C3 FC4 C1 CP3 Cz C2 C4 CP1 CPz CP4 CP2 C6".split(),
 ))
+ITALIA_CHANNELS = "Fp1 Fpz Fp2 F7 F3 Fz F4 F8 FC5 FC1 FC2 FC6 M1 T7 C3 Cz C4 T8 M2 CP5 CP1 CP2 CP6 P7 P3 Pz P4 P8 AF7 AF3 AF4 AF8 F5 F1 F2 F6 FC3 FCz FC4 C5 C1 C2 C6 CP3 CP4 P5 P1 P2 P6 FT7 FT8 TP7 TP8".split()
+
+
+def project_name(path):
+    parts = [p.casefold() for p in Path(path).parts]
+    return "Italia" if any(p in {"projeto italia", "projeto itália"} for p in parts) else "Brasil"
+
 COLORS      = {
     "LEFT": "#0072B2", "RIGHT": "#D55E00", "BOTH": "#332288",
     "REST": "#4D4D4D", "ATTENTION": "#009E73",
@@ -48,7 +55,7 @@ def settings(path=None):
             raise ValueError(f"{name} precisa estar dentro da época.")
     if base["step"] <= 0 or min(base["windows"]) <= 0 or min(base["offsets"]) < 0:
         raise ValueError("Janelas/passo positivos; offsets não negativos.")
-    if base["erd_baseline_mode"] not in {"preceding_pause", "fixed"}:
+    if base["erd_baseline_mode"] not in {"preceding_pause", "fixed", "attention"}:
         raise ValueError("erd_baseline_mode deve ser preceding_pause ou fixed.")
     if base["curve_smoothing_s"] <= 0:
         raise ValueError("curve_smoothing_s deve ser positivo.")
@@ -72,11 +79,12 @@ def scan(root, control):
     for signal in sorted(root.rglob("*_signal_*.csv")):
         marker  = signal.with_name(signal.name.replace("_signal_", "_markers_"))
         parts   = signal.relative_to(root).parts
-        subject = next((p for p in parts if re.fullmatch(r"[A-Za-z]{2}\d+", p)), "UNKNOWN")
+        project = project_name(signal)
+        subject = next((p for p in parts if re.fullmatch(r"[A-Za-z]{2,}\d+", p)), "UNKNOWN")
         session = next((p for p in parts if re.fullmatch(r"S\d+", p, re.I)), "UNKNOWN")
-        block   = next((p for p in parts if p.lower() in {"im_treino", "em_treino", "online"}), "UNKNOWN")
+        block   = next((p for p in parts if re.match(r"^(im_treino|em_treino|online)(?:$|[_ -])",p,re.I)), "UNKNOWN")
         text    = str(signal).lower()
-        kind    = {"im_treino": "IM_treino", "em_treino": "EM_treino"}.get(block.lower(), "online_definir")
+        kind    = "IM_treino" if block.lower().startswith("im_treino") else ("EM_treino" if block.lower().startswith("em_treino") else "online_definir")
         if kind == "online_definir":
             if any(s in text for s in ["sem_feedback", "no_feedback", "nofeedback", "without_feedback"]):
                 kind = "online_sem_feedback"
@@ -86,7 +94,8 @@ def scan(root, control):
         stage = "train" if "train" in [p.lower() for p in parts] or "_train_" in signal.stem.lower() else ""
         stamp = stamp.group(1) if stamp else signal.stem.split("_")[-1]
         rows.append(dict(
-            run_id=f"{subject}_{session}_{block}_{stage}_{stamp}", include=False,
+            run_id=(f"Italia_{subject}_{session}_{block}_{stage}_{stamp}" if project == "Italia" else f"{subject}_{session}_{block}_{stage}_{stamp}"), include=False,
+            project=project,
             group="UNASSIGNED", subject=subject, session=session, block=block,
             block_type=kind, stage=stage, stamp=stamp,
             signal_path=signal.relative_to(root).as_posix(),
@@ -103,6 +112,8 @@ def scan(root, control):
         old = pd.read_csv(control, keep_default_na=False)
         if old.run_id.duplicated().any():
             raise ValueError("run_id duplicado na tabela de controle.")
+        if "project" not in old:
+            old["project"]=old.signal_path.map(project_name)
         old = old.set_index("run_id")
         for column in ["include", "group", "block_type", "bad_channels", "exclude_trials", "reason", "train_run_id"]:
             if column in old:
@@ -119,13 +130,15 @@ def scan(root, control):
     return current
 
 
-def selection(control, subjects=None, sessions=None, blocks=None, runs=None):
+def selection(control, subjects=None, sessions=None, blocks=None, runs=None, projects=None):
     frame = pd.read_csv(control, keep_default_na=False)
     if frame.run_id.duplicated().any() or frame.run_id.astype(str).str.contains(r"[/\\]").any():
         raise ValueError("run_id deve ser único e não conter separadores de caminho.")
+    if "project" not in frame:
+        frame["project"] = frame.signal_path.map(project_name)
     frame["block_type"] = frame.block_type.replace("online_definir", "online_com_feedback")
     frame = frame[truth(frame.include) & frame.block_type.isin(BLOCKS)].copy()
-    for column, values in [("subject", subjects), ("session", sessions), ("block_type", blocks), ("run_id", runs)]:
+    for column, values in [("subject", subjects), ("session", sessions), ("block_type", blocks), ("run_id", runs), ("project", projects)]:
         if values:
             frame = frame[frame[column].isin(values)]
     return frame.sort_values(["subject", "session", "stamp"]).reset_index(drop=True)
@@ -255,7 +268,33 @@ def load_run(root, row, cfg):
         raise ValueError("Nenhum marcador sobrepõe o sinal; conferir relógios LSL.")
     if outside.any():
         warnings.warn("Marcadores nas bordas/fora do sinal: registrados no QC, sem deslocar ou recortar timestamps.", RuntimeWarning)
-    names = [CHANNEL_MAP.get(c, c.upper()) for c in cols]
+    project = str(row.get("project", project_name(row.signal_path)))
+    configured = cfg.get("channel_names")
+    mapping = configured or (ITALIA_CHANNELS if project == "Italia" else list(CHANNEL_MAP.values()))
+    ignored_trigger = False
+    if len(cols) == len(mapping) + 1 and np.all(data[-1] == 0):
+        data, cols, ignored_trigger = data[:-1], cols[:-1], True
+    if len(cols) > len(mapping):
+        raise ValueError("Canais sem mapa: configure channel_names; canal extra só é ignorado se totalmente zerado (TRIGGER).")
+    names = list(mapping[:len(cols)])
+    source_sfreq, source_samples = sfreq, len(times)
+    from scipy.signal import welch
+    frequency,spectrum=welch(data,fs=sfreq,nperseg=min(len(times),round(4*sfreq)),axis=-1)
+    total=spectrum[:,(frequency>=1)&(frequency<min(100,sfreq/2))].sum(axis=1)
+    line=spectrum[:,(np.abs(frequency-50)<=1)|(np.abs(frequency-60)<=1)].sum(axis=1)/np.maximum(total,1e-30)*100
+    source_line_noise=dict(zip(names,line.tolist()))
+    factor = cfg.get("analysis_decimation", "auto")
+    factor = (2 if sfreq >= 250 else 1) if factor == "auto" else int(factor)
+    if factor not in {1, 2}:
+        raise ValueError("analysis_decimation deve ser auto, 1 ou 2.")
+    if cfg["h_freq"] >= sfreq / factor / 2:
+        raise ValueError("Decimação deixaria h_freq acima de Nyquist.")
+    if factor > 1:
+        # Causal antialiasing precedes simple stride; the same signal feeds train/test.
+        data = mne.filter.filter_data(data, sfreq, None, min(cfg["h_freq"], sfreq / factor * .4),
+                                    method="iir", phase="forward", iir_params=dict(order=8, ftype="butter"), verbose=False)[:, ::factor]
+        times, sfreq = times[::factor], sfreq / factor
+
     raw   = mne.io.RawArray(data, mne.create_info(names, sfreq, "eeg"), verbose=False)
     available = mne.channels.get_builtin_montages()
     montage   = "colin27_1020" if "colin27_1020" in available else "standard_1020"
@@ -282,7 +321,7 @@ def load_run(root, row, cfg):
     trials["manual_exclusion"] = trials.trial.isin(excluded)
     trials["valid"] &= ~trials.manual_exclusion
     trials["valid"] &= trials.attempt_start.between(times[0], times[-1])
-    qc = dict(sfreq=sfreq, n_samples=len(times), duration_s=float(times[-1] - times[0]),
+    qc = dict(source_line_noise_percent=source_line_noise, project=project, source_sfreq=source_sfreq, source_samples=source_samples, decimation=factor, ignored_zero_trigger=ignored_trigger, sfreq=sfreq, n_samples=len(times), duration_s=float(times[-1] - times[0]),
               jitter_p99=jitter, timestamp_drift_s=drift, timing=timing, montage=montage, marker_bounds=marker_bounds, channels=names, bad_channels=bads,
               peak_to_peak_uv=dict(zip(names, np.ptp(data, axis=1) * 1e6)),
               std_uv=dict(zip(names, np.std(data, axis=1) * 1e6)),

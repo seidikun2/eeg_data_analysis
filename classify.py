@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from itertools import product
+import hashlib
 import json
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
 from eeg import PROTOCOLS
 
@@ -43,9 +45,18 @@ class BandFeatures(TransformerMixin, BaseEstimator):
 
 
 def candidates(cfg):
-    params = [dict(window=w, offset=o, bands=b, pipeline=p, C=c, gamma=g)
-              for w, o, b, p, c, g in product(cfg["windows"], cfg["offsets"], cfg["bands"],
-                                            cfg["pipelines"], cfg["svm_c"], cfg["svm_gamma"])]
+    params = []
+    seen = set()
+    for w, o, b, p, classifier, c, g in product(cfg["windows"], cfg["offsets"], cfg["bands"],
+                      cfg["pipelines"], cfg.get("classifiers", ["svm_rbf"]), cfg["svm_c"], cfg["svm_gamma"]):
+        if classifier not in {"lda", "svm_linear", "svm_rbf"}:
+            raise ValueError(f"Classificador desconhecido: {classifier}")
+        param = dict(window=w, offset=o, bands=b, pipeline=p, classifier=classifier,
+                     C=c if classifier != "lda" else None, gamma=g if classifier == "svm_rbf" else None)
+        key = json.dumps(param, sort_keys=True)
+        if key not in seen:
+            params.append(param)
+            seen.add(key)
     budget = cfg["search_budget"]
     if budget < 1:
         raise ValueError("search_budget deve ser positivo.")
@@ -167,9 +178,89 @@ def trial_splits(meta, max_splits, seed):
 
 
 def estimator(params, cfg):
-    return make_pipeline(BandFeatures(params["pipeline"]), StandardScaler(),
-                         SVC(C=params["C"], gamma=params["gamma"], kernel="rbf",
-                             class_weight="balanced", random_state=cfg["seed"]))
+    kind = params.get("classifier", "svm_rbf")
+    if kind == "lda":
+        classifier = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")
+    else:
+        classifier = SVC(C=params["C"], gamma=params.get("gamma") or "scale",
+                         kernel="linear" if kind == "svm_linear" else "rbf",
+                         class_weight="balanced", random_state=cfg["seed"])
+    return make_pipeline(BandFeatures(params["pipeline"]), StandardScaler(), classifier)
+
+
+def parameter_id(params):
+    return hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def fixed_parameter_cv(datasets, cfg):
+    """Same grouped folds for every fixed candidate; selection scores, not test estimates."""
+    base = datasets[0][2]
+    splits = trial_splits(base, cfg["outer_folds"], cfg["seed"])
+    trial_folds = [(set(base.trial.iloc[tr]), set(base.trial.iloc[te])) for tr, te in splits]
+    records = []
+    for params, X, meta in datasets:
+        for fold, (train_trials, test_trials) in enumerate(trial_folds):
+            tr, te = np.flatnonzero(meta.trial.isin(train_trials)), np.flatnonzero(meta.trial.isin(test_trials))
+            row = dict(candidate_id=parameter_id(params), fold=fold, params=params,
+                       train_trials=sorted(train_trials), test_trials=sorted(test_trials),
+                       role="selection_cv_not_independent_test")
+            try:
+                model = estimator(params, cfg).fit(X[tr], meta.target.iloc[tr])
+                row.update(status="ok", balanced_accuracy=phase_score(meta.iloc[te], model.predict(X[te])))
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                row.update(status=str(exc), balanced_accuracy=None)
+            records.append(row)
+    return records
+
+
+def block_windows(run, cfg, params):
+    """Causal full-block inference, including inter-trial intervals; no edge extrapolation."""
+    sfreq = run.raw.info["sfreq"]
+    picks = mne.pick_types(run.raw.info, eeg=True, exclude="bads")
+    segment = run.raw.get_data(picks=picks)
+    for frequency in cfg["notch"]:
+        if frequency < sfreq / 2:
+            segment = mne.filter.notch_filter(segment, sfreq, [frequency], method="iir", phase="forward", verbose=False)
+    if cfg["reference"] == "average":
+        segment -= segment.mean(axis=0, keepdims=True)
+    filtered = np.stack([mne.filter.filter_data(segment, sfreq, lo, hi, method="iir", phase="forward",
+                  iir_params=dict(order=4, ftype="butter"), verbose=False) for lo, hi in params["bands"]])
+    size, step = round(params["window"] * sfreq), max(1, round(cfg["step"] * sfreq))
+    starts = np.arange(0, segment.shape[-1] - size + 1, step)
+    # Chunk prediction below avoids a giant materialized window tensor on long recordings.
+    return filtered, starts, size
+
+
+def full_block_prediction(model, run, cfg, params, role):
+    filtered, starts, size = block_windows(run, cfg, params)
+    records = []
+    sfreq = run.raw.info["sfreq"]
+    for chunk in range(0, len(starts), 256):
+        selected = starts[chunk:chunk + 256]
+        X = np.stack([filtered[:, :, first:first + size] for first in selected])
+        probabilities = model.predict_proba(X)
+        for first, probs in zip(selected, probabilities):
+            end = run.times[0] + (first + size) / sfreq
+            matches = run.trials[(run.trials.attention_start <= end) & (run.trials.pause_end > end)]
+            trial = matches.iloc[-1] if len(matches) else None
+            records.append(dict(trial=int(trial.trial) if trial is not None else -1,
+                                trial_class=trial.trial_class if trial is not None else "INTERVAL",
+                                phase=("ATTEMPT" if trial is not None and trial.attempt_start <= end < trial.attempt_end else "CONTEXT"),
+                                start_abs=end, time_end=end - trial.attempt_start if trial is not None else np.nan,
+                                fold=-1, prediction_role=role, context_only=trial is None,
+                                **{f"p_{cls}": float(v) for cls, v in zip(model.classes_, probs)}))
+    return pd.DataFrame(records)
+
+
+def final_model(train_run, train_accepted, cfg, protocol, params, rest_source=None):
+    # Match deployment preprocessing: continuous causal filtering, but supervised windows
+    # are wholly within eligible trial phases. They never cross trial boundaries.
+    X, meta = windows(train_run, cfg, params, protocol, train_accepted, rest_source)
+    filtered, _, size = block_windows(train_run, cfg, params)
+    sfreq = train_run.raw.info["sfreq"]
+    starts = np.rint((meta.start_abs.to_numpy() - train_run.times[0]) * sfreq).astype(int)
+    X = np.stack([filtered[:, :, first:first + size] for first in starts])
+    return calibrated(params, X, meta, cfg)
 
 
 def phase_score(meta, predictions):
@@ -256,18 +347,34 @@ def evaluate(run, cfg, protocol, accepted, training=None):
         train_sets, invalid_train = prepare(train_run, cfg, protocol, train_accepted, source, require_cv=True)
         invalid += invalid_train
         partitions = [(set(train_sets[0][2].trial), set(datasets[0][2].trial))]
+    fixed_cv = fixed_parameter_cv(train_sets, cfg) if cfg.get("fixed_parameter_cv", True) else []
+    if fixed_cv:
+        scores={}
+        for record in fixed_cv:
+            scores.setdefault(record['candidate_id'],[]).append(record)
+        valid={cid:np.mean([r['balanced_accuracy'] for r in part]) for cid,part in scores.items() if all(r['status']=='ok' for r in part)}
+        if not valid:
+            raise ValueError('Nenhuma parametrização completou todos os folds da CV fixa.')
+        best_id=max(valid,key=valid.get)
+        deployment_index=next(i for i,(params,_,_) in enumerate(train_sets) if parameter_id(params)==best_id)
+    else:
+        deployment_index,_=choose(train_sets,set(train_sets[0][2].trial),cfg)
     evaluated_trials = set(datasets[0][2].trial)
     extra_context = sorted(set(accepted) - evaluated_trials)
     for fold, (train_trials, test_trials) in enumerate(partitions):
-        index, search    = choose(train_sets, train_trials, cfg)
+        index, search    = choose(train_sets, train_trials, cfg) if training is None else (deployment_index, fixed_cv)
         params, Xtr, mtr = train_sets[index]
         tr               = np.flatnonzero(mtr.trial.isin(train_trials))
-        model            = calibrated(params, Xtr[tr], mtr.iloc[tr].reset_index(drop=True), cfg)
+        model            = (calibrated(params, Xtr[tr], mtr.iloc[tr].reset_index(drop=True), cfg) if training is None
+                            else final_model(train_run, train_accepted, cfg, protocol, params, train_sets[0][2].rest_source.iloc[0]))
         if training is None:
             Xte, mte = Xtr, mtr
         else:
             Xte, mte = windows(run, cfg, params, protocol, accepted,
                                rest_source=datasets[0][2].rest_source.iloc[0])
+            filtered,_,size = block_windows(run,cfg,params)
+            starts=np.rint((mte.start_abs.to_numpy()-run.times[0])*run.raw.info['sfreq']).astype(int)
+            Xte=np.stack([filtered[:,:,first:first+size] for first in starts])
         te            = np.flatnonzero(mte.trial.isin(test_trials))
         proba         = model.predict_proba(Xte[te])
         pred          = model.classes_[proba.argmax(axis=1)]
@@ -311,6 +418,14 @@ def evaluate(run, cfg, protocol, accepted, training=None):
         _timeline=pd.concat(timelines, ignore_index=True).to_dict("records") if timelines else [],
         preprocessing="causal Butterworth ordem 4 por trial; referência conforme config; canais ruins excluídos",
     )
+    # A fixed deployment model is selected using training data only.
+    deployed_params = train_sets[deployment_index][0]
+    source_run, source_accepted = training if training is not None else (run, accepted)
+    deployed_model = model if training is not None else final_model(source_run, source_accepted, cfg, protocol, deployed_params, train_sets[0][2].rest_source.iloc[0])
+    role = "online_test_prior_IM_treino" if training is not None else "in_sample_IM_treino_not_validation"
+    continuous = full_block_prediction(deployed_model, run, cfg, deployed_params, role)
+    summary.update(fixed_parameter_cv=fixed_cv, deployment_params=deployed_params,
+                   continuous_role=role, _continuous_timeline=continuous.to_dict("records"))
     return summary, predictions, phase
 
 
@@ -320,6 +435,12 @@ def save_result(result, directory, prefix=""):
     name                        = prefix + summary["protocol"]
     summary                     = summary.copy()
     timeline                    = summary.pop("_timeline", [])
+    continuous                  = summary.pop("_continuous_timeline", [])
+    fixed_cv                    = summary.pop("fixed_parameter_cv", [])
+    if continuous:
+        pd.DataFrame(continuous).to_csv(directory / f"{name}_continuous_timeline.csv", index=False)
+    if fixed_cv:
+        pd.DataFrame([{**{k: v for k, v in r.items() if k != "params"}, **r["params"]} for r in fixed_cv]).to_csv(directory / f"{name}_fixed_cv.csv", index=False)
     if timeline:
         pd.DataFrame(timeline).to_csv(directory / f"{name}_timeline.csv", index=False)
     (directory / f"{name}.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))

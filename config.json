@@ -12,24 +12,98 @@
   "attempt_duration": 3.75,
   "epoch_tmin": -3.5,
   "epoch_tmax": 5.25,
-  "baseline": [-3.0, -2.0],
-  "active": [0.5, 3.5],
-  "frequencies": [6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40],
-  "mu": [8, 13],
-  "beta": [13, 30],
+  "baseline": [
+    -3.0,
+    -2.0
+  ],
+  "active": [
+    0.5,
+    3.5
+  ],
+  "frequencies": [
+    6,
+    8,
+    10,
+    12,
+    14,
+    16,
+    18,
+    20,
+    22,
+    24,
+    26,
+    28,
+    30,
+    32,
+    34,
+    36,
+    38,
+    40
+  ],
+  "mu": [
+    8,
+    13
+  ],
+  "beta": [
+    13,
+    30
+  ],
   "step": 0.2,
-  "windows": [1.0, 1.5],
-  "offsets": [0.0, 0.5],
-  "bands": [[[8, 30]], [[8, 13], [13, 30]]],
-  "pipelines": ["tgsp"],
-  "svm_c": [0.1, 1.0, 10.0],
-  "svm_gamma": ["scale"],
+  "windows": [
+    1.0,
+    1.5
+  ],
+  "offsets": [
+    0.0,
+    0.5
+  ],
+  "bands": [
+    [
+      [
+        8,
+        30
+      ]
+    ],
+    [
+      [
+        8,
+        13
+      ],
+      [
+        13,
+        30
+      ]
+    ]
+  ],
+  "pipelines": [
+    "tgsp"
+  ],
+  "svm_c": [
+    0.1,
+    1.0,
+    10.0
+  ],
+  "svm_gamma": [
+    "scale"
+  ],
   "outer_folds": 5,
   "inner_folds": 3,
   "search_budget": 12,
   "seed": 42,
   "dpi": 300,
   "curve_smoothing_s": 0.6,
-  "erd_baseline_mode": "preceding_pause",
-  "comparison_pipelines": ["tgsp", "csp"]
+  "erd_baseline_mode": "attention",
+  "comparison_pipelines": [
+    "tgsp",
+    "csp"
+  ],
+  "classifiers": [
+    "lda",
+    "svm_linear",
+    "svm_rbf"
+  ],
+  "channel_names": null,
+  "analysis_decimation": "auto",
+  "fixed_parameter_cv": true,
+  "erp_baseline_mode": "attention"
 }
