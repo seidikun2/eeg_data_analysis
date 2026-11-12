@@ -24,15 +24,15 @@ não são modificados: gere uma nova execução para usar o novo formato.
 2. Em **Controle dos dados**, marque `include`, revise `block_type` e salve.
 3. Filtre sujeitos, sessões, blocos e registros na barra lateral; vazio significa todos.
 4. Execute **Verificar dados antes da análise**. O check informa erro/aviso e ação por registro.
-5. Em **Produzir relatório**, escolha eletrofisiologia, classificação ou ambas.
+5. Em **Gerar relatório**, escolha eletrofisiologia, classificação ou ambas.
 6. Para comparação, marque **Batch comparativo: avaliar TGSP e CSP separadamente**.
    Em **Ajustar experimento e visualização**, selecione janelas, offsets, bandas/bancos, C do SVM e orçamento de busca.
-7. Gere os relatórios. Em **Consultar resultados**, baixe o HTML individual ou o comparativo.
+7. Gere os relatórios. Em **4. Consultar resultados**, baixe o HTML individual ou o comparativo.
 
 Abra o HTML no navegador: os gráficos interativos têm zoom por seleção, roda, pan e
 restauração por duplo clique. A legenda permite ocultar traços. Figuras estáticas abrem
 em um visualizador com zoom e arraste. Tudo funciona offline, incluindo os gráficos Plotly.
-Dados técnicos, tabelas e figuras extensas começam recolhidos.
+As seções ficam visíveis em ordem previsível. Detalhes extensos permanecem nos CSVs/JSONs de auditoria.
 
 ## Batch comparativo
 
@@ -51,7 +51,7 @@ python analyze.py report --root "/caminho/dados" --subjects AB01 --sessions S1 -
 Os filtros `--subjects`, `--sessions`, `--blocks` e `--runs` são opcionais. Também existem
 `--config`, `--control`, `--output` e `--mode ephys|classification|both`.
 
-`comparison.html` mostra BA por sujeito/pipeline e ERD/ERS central por classe e banda.
+`index.html` é o relatório geral completo: BA em pontos por sujeito/sessão/registro/pipeline, evolução do ERD/ERS por tentativa e links dos relatórios individuais. `comparison.html` redireciona ao geral por compatibilidade.
 `comparison_runs.csv` conserva cada registro; `comparison_subjects.csv` agrega as repetições
 dentro de cada sujeito; `pipeline_paired_differences.csv` contém diferenças pareadas de BA.
 `erd_subjects.csv` agrega primeiro os trials por registro e depois os registros por sujeito.
@@ -73,14 +73,12 @@ O orçamento limita candidatos por busca; `comparison_pipelines` define as famí
   por canal. A mediana de cada traço é removida **apenas para exibição**. O eixo continua em µV.
   A faixa inicial de exibição usa P99,5; extremos podem ficar fora do enquadramento e podem
   ser examinados ajustando o eixo interativo. Os valores completos ficam nas tabelas de QC.
-- **ERP:** uma figura por classe, subplots por canal, média dos trials em linha forte e
-  ±1 desvio-padrão em faixa clara. Escalas por canal, identificadas em µV; não se colorizam canais.
-- **Espectrograma:** C3/Cz/C4 separadamente, escala comum em dB (µV²/Hz), paleta cividis.
-- **ERD/ERS:** mu/beta por C3/Cz/C4 e classe, média ± DP, tempo–frequência por canal e
+- **ERP:** uma grade por canal e classe, trials discretos e média preta destacada. Escalas por canal, identificadas em µV; não se colorizam canais.
+- **ERD/ERS:** mu/beta por C3/Cz/C4 e classe, trials individuais e média preta, tempo–frequência alinhado ao ATTEMPT por canal e
   topografias com escala comum. Negativo = redução; positivo = aumento de potência.
 - **Classificação:** matriz de confusão, scores externos, timeline contínua de teste,
   curvas por época com alpha crescente por cronologia e média destacada.
-- **Detalhes:** PCA 2D/3D, cada época antes/depois, motivos de rejeição, configuração,
+- **Detalhes:** PCA 2D/3D com janelas reais dependentes e IDs de trial, épocas conjuntas antes/depois, motivos de rejeição, configuração,
   versões e hashes dos arquivos. Épocas rejeitadas também podem ser inspecionadas.
 
 Paleta de classes: Okabe–Ito com azul/laranja/verde/roxo/cinza; mapas sequenciais em cividis
@@ -177,3 +175,17 @@ Cada execução tem pasta própria, `index.html`, `comparison.html`, CSVs e JSON
 
 Testes: `python -m pip install pytest && python -m pytest -q`. São testes com dados sintéticos;
 valide unidades, mapa dos canais, protocolo e limiares em suas gravações reais.
+
+## Apresentação consolidada
+
+Fluxo visível: selecionar dados/filtros → verificar qualidade → gerar individual ou geral → consultar.
+Os parâmetros avançados ficam em uma única área secundária (janelas, offsets, bancos, C e gamma do SVM).
+O download ZIP preserva os links entre o geral, os individuais e os arquivos de auditoria. Abra `index.html` após extrair.
+O relatório individual reúne processamento, qualidade, snapshot central, ERP, ERD/ERS, topografias e classificação.
+A timeline ocupa a largura inteira, com ATTEMPT sombreado e classe/ID indicados. Zoom por seleção/roda e
+figuras ampliáveis funcionam offline. Lacunas entre trials continuam sem conexão; suavização é apenas visual.
+Folds aparecem como dispersão dependente, sem linhas sequenciais. PCA usa janelas reais de até 1 s
+dentro do intervalo ativo: linhas e IDs mantêm a identidade do trial; não aumenta a amostra independente.
+
+Validação: `python -m pytest -q` inclui batch real com dois sujeitos sintéticos e TGSP/CSP,
+auditoria de separação treino/teste por trial e intervalos da timeline. Não substitui validação nas gravações reais.

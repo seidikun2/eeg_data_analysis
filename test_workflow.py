@@ -138,11 +138,11 @@ def test_report_and_interface(tmp_path):
     folder = output / results[0]["run_id"]
     for name in ["report.html", "dashboard.png", "topografias_mu_beta.pdf", "pca_2d_3d.png", "baseline_audit.csv"]:
         assert (folder / name).stat().st_size > 100
-    assert "Trial 0" in (folder / "report.html").read_text()
+    assert "Épocas · antes/depois conjuntos" in (folder / "report.html").read_text()
     at = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
     at.sidebar.text_input[0].set_value(str(tmp_path)).run()
     assert not list(at.exception)
-    assert [t.label for t in at.tabs] == ["Controle dos dados", "Produzir relatório", "Consultar resultados"]
+    assert [h.value for h in at.header] == ["1. Selecionar dados e filtros", "2. Verificar qualidade e 3. Gerar relatório", "4. Consultar resultados"]
 
 
 def test_online_requires_prior_included_calibration(tmp_path):
@@ -308,3 +308,52 @@ def test_batch_comparison_aggregates_subjects_not_runs(tmp_path):
     assert len(frame)==2
     assert frame.n_runs.eq(2).all()
     assert np.allclose(frame.balanced_accuracy,.6)
+
+
+def test_general_report_two_subjects_and_pipelines(tmp_path):
+    """Exercise actual batch generation, not a one-subject comparison mock."""
+    import shutil
+    from analyze import batch
+    control = synthetic(tmp_path, n=8)
+    shutil.copytree(tmp_path / "AB01", tmp_path / "CD02")
+    indexed = scan(tmp_path, control)
+    indexed["include"] = True
+    indexed.to_csv(control, index=False)
+    output = tmp_path / "output"
+    results = batch(tmp_path, control, output, quick_config(), mode="both",
+                    protocols=["left_right"], compare=True)
+    assert len(results) == 2
+    assert all(r["status"] == "ok" for r in results)
+    assert all(len(r["classification"]) == 2 and all(m["status"] == "ok" for m in r["classification"]) for r in results)
+    general = (output / "index.html").read_text()
+    assert "AB01" in general and "CD02" in general
+    assert "evolução nas tentativas" in general
+    assert "Relatórios individuais" in general
+    assert "<details" not in general
+    comparisons = pd.read_csv(output / "comparison_runs.csv")
+    assert set(comparisons.subject) == {"AB01", "CD02"}
+    assert set(comparisons.pipeline) == {"tgsp", "csp"}
+    assert set(comparisons.session) == {"S1"}
+    for result in results:
+        folder = output / result["run_id"]
+        for name in ["tgsp_left_right", "csp_left_right"]:
+            import json
+            summary = json.loads((folder / f"{name}.json").read_text())
+            for fold in summary["folds"]:
+                assert not set(fold["train_trials"]) & set(fold["test_trials"])
+
+
+def test_timeline_background_and_gaps(tmp_path):
+    from reporting import timeline_plot
+    control = synthetic(tmp_path)
+    cfg = quick_config()
+    run = load_run(tmp_path, selection(control).iloc[0], cfg)
+    _, epochs, _ = make_epochs(run, cfg)
+    summary, _, _ = evaluate(run, cfg, "left_right", set(epochs.metadata.trial))
+    timeline = pd.DataFrame(summary["_timeline"])
+    fig = timeline_plot(summary, timeline, cfg, run.trials)
+    regions = [s for s in fig.layout.shapes if s.type == "rect"]
+    assert len(regions) == timeline.trial.nunique()
+    for trace in fig.data:
+        assert trace.connectgaps is not True
+    assert fig.layout.xaxis.domain == (0., 1.)

@@ -37,12 +37,12 @@ class Report:
                           config=dict(scrollZoom=True, displaylogo=False, responsive=True)), True))
 
     def save(self, path, **kwargs):
-        cards = [f'<details id="section-{i}" {"open" if opened else ""}><summary>{html.escape(title)}</summary><div class="content">{content}</div></details>'
+        cards = [f'<section id="section-{i}"><h2>{html.escape(title)}</h2><div class="content">{content}</div></section>'
                  for i, (title, content, opened) in enumerate(self.items)]
         page  = '''<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{font:16px system-ui;color:#20252b;background:#f2f4f7;margin:0}main{max-width:1280px;margin:auto;padding:24px}h1{font-size:24px}details{background:white;border:1px solid #d6dbe1;border-radius:8px;margin:20px 0}summary{padding:18px;cursor:pointer;font-weight:600}.content{padding:8px 20px 24px;overflow:auto}table{border-collapse:collapse;font-size:14px}th,td{padding:9px;border-bottom:1px solid #ddd;text-align:left}pre{white-space:pre-wrap;font-size:12px}img{max-width:100%;height:auto}.enlarge{border:0;background:white;cursor:zoom-in;width:100%}.hint{color:#505b66}.viewer{position:fixed;inset:0;background:#18202cfa;z-index:9999;display:none}.toolbar{height:52px;display:flex;gap:16px;align-items:center;padding:0 20px;color:white}.toolbar button{padding:8px 16px;cursor:pointer}.viewport{height:calc(100% - 52px);overflow:auto;cursor:grab}.viewport img{max-width:none;display:block}.cards{display:flex;gap:20px;flex-wrap:wrap}.card{padding:16px;background:#f4f6f8;border-radius:6px;min-width:130px}.card strong{display:block;font-size:25px}</style>
+<style>body{font:16px system-ui;color:#20252b;background:#f2f4f7;margin:0}main{max-width:1280px;margin:auto;padding:24px}h1{font-size:24px}section{background:white;border:1px solid #d6dbe1;border-radius:8px;margin:20px 0}h2{padding:18px;font-size:19px;margin:0}.content{padding:8px 20px 24px;overflow:auto}table{border-collapse:collapse;font-size:14px}th,td{padding:9px;border-bottom:1px solid #ddd;text-align:left}pre{white-space:pre-wrap;font-size:12px}img{max-width:100%;height:auto}.enlarge{border:0;background:white;cursor:zoom-in;width:100%}.hint{color:#505b66}.viewer{position:fixed;inset:0;background:#18202cfa;z-index:9999;display:none}.toolbar{height:52px;display:flex;gap:16px;align-items:center;padding:0 20px;color:white}.toolbar button{padding:8px 16px;cursor:pointer}.viewport{height:calc(100% - 52px);overflow:auto;cursor:grab}.viewport img{max-width:none;display:block}.cards{display:flex;gap:20px;flex-wrap:wrap}.card{padding:16px;background:#f4f6f8;border-radius:6px;min-width:130px}.card strong{display:block;font-size:25px}</style>
 <title>''' + html.escape(self.title) + '</title><script>' + get_plotlyjs() + '''</script><main><h1>''' + html.escape(self.title) + '''</h1>
-<p class="hint">Gráficos interativos: arraste para selecionar zoom; duplo clique restaura; legenda oculta/mostra traços. Figuras: clique para ampliar, use a roda para zoom e arraste para navegar. Conteúdo técnico fica recolhido.</p>''' + "".join(cards) + '''</main>
+<p class="hint">Gráficos interativos: arraste para selecionar zoom; duplo clique restaura; legenda oculta/mostra traços. Figuras: clique para ampliar, use a roda para zoom e arraste para navegar. Seções visíveis; detalhes extensos nos arquivos CSV/JSON de auditoria.</p>''' + "".join(cards) + '''</main>
 <div class="viewer" role="dialog" aria-label="Figura ampliada"><div class="toolbar"><button id="close">Fechar (Esc)</button><button id="fit">Ajustar à tela</button><button id="plus">+</button><button id="minus">−</button><span id="zoom"></span></div><div class="viewport"><img alt="Figura ampliada"></div></div>
 <script>const viewer=document.querySelector('.viewer'),vp=document.querySelector('.viewport'),pic=vp.querySelector('img');let scale=1,drag=null;
 function resize(){pic.style.width=(pic.naturalWidth*scale)+'px';document.querySelector('#zoom').textContent=Math.round(scale*100)+'%'}
@@ -101,12 +101,19 @@ def mean_curve(traces, cfg):
     return grid, table.mean(axis=0).to_numpy(), table.notna().sum(axis=0).to_numpy()
 
 
-def timeline_plot(summary, timeline, cfg):
+def timeline_plot(summary, timeline, cfg, trials=None):
     values = smoothed_timeline(timeline, cfg["curve_smoothing_s"])
     labels = summary["labels"]
     fig    = make_subplots(rows=2, cols=1, subplot_titles=["Linha temporal · somente trials de teste", "Épocas alinhadas · ATTEMPT · média em destaque"], vertical_spacing=0.2)
     origin = values.start_abs.min()
     ranks  = {t: i / max(1, values.trial.nunique() - 1) for i, t in enumerate(sorted(values.trial.unique()))}
+    if trials is not None:
+        for trial in trials.itertuples():
+            if trial.trial not in set(values.trial):
+                continue
+            fig.add_vrect(x0=trial.attempt_start - origin, x1=trial.attempt_end - origin,
+                          fillcolor=COLORS.get(trial.trial_class, "#777777"), opacity=.09, line_width=1,
+                          annotation_text=f"{trial.trial_class} · {trial.trial}", row=1, col=1, exclude_empty_subplots=False)
     for cls in labels:
         traces = []
         for trial, sub in values.groupby("trial"):
@@ -154,17 +161,18 @@ def batch_comparison(output, results):
         keys    = ['subject', 'block_type', 'protocol', 'pipeline', 'validation']
         grouped = frame.groupby(keys, as_index=False).agg(balanced_accuracy=('balanced_accuracy', 'mean'), n_runs=('run_id', 'nunique'), chance=('chance', 'first'))
         grouped.to_csv(Path(output) / 'comparison_subjects.csv', index=False)
-        for (block, protocol, validation), sub in grouped.groupby(['block_type', 'protocol', 'validation']):
-            fig = go.Figure()
+        for (block, protocol, validation), sub in frame.groupby(['block_type', 'protocol', 'validation']):
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(12, 5), layout="constrained")
             for i, (pipeline, values) in enumerate(sub.groupby('pipeline')):
-                values = values.sort_values('subject')
-                fig.add_trace(go.Scatter(x=values.subject, y=values.balanced_accuracy, name=pipeline, mode='markers+lines',
-                                        line=dict(color=['#0072B2','#D55E00','#009E73'][i % 3], dash=['solid','dash','dot'][i % 3]),
-                                        marker=dict(size=10, symbol=['circle','diamond','square'][i % 3]), customdata=values.n_runs,
-                                        hovertemplate='%{x}<br>BA=%{y:.3f}<br>%{customdata} registro(s)<extra>%{fullData.name}</extra>'))
-            fig.add_hline(y=sub.chance.iloc[0], line_dash='dot', line_color='#555555')
-            fig.update_layout(height=450, title=f'{block} · {protocol} · {validation}', yaxis=dict(range=[0,1], title='BA média por sujeito'), xaxis_title='Sujeito')
-            report.add_plotly(fig, f'Classificação · {block} · {protocol} · {validation}')
+                labels = values.subject + ' / ' + values.session + ' / ' + values.run_id
+                ax.scatter(labels, values.balanced_accuracy, label=pipeline, marker=['o', 'D', 's'][i % 3], s=50)
+            ax.axhline(sub.chance.iloc[0], ls=':', color='.4', label='Acaso')
+            ax.set(ylim=(0, 1), ylabel='Balanced accuracy por registro', title=f'{block} · {protocol} · {validation}')
+            ax.tick_params(axis='x', labelrotation=25, labelsize=7)
+            ax.legend()
+            report.add_figure(fig, f'Classificação · {block} · {protocol} · {validation}')
+            plt.close(fig)
         report.add_html(grouped.to_html(index=False, float_format=lambda v: f'{v:.3f}'), title='Tabela · resultados por sujeito')
         # Diferenças pareadas de pipelines, com cada sujeito contribuindo uma vez.
         paired = []
@@ -186,13 +194,34 @@ def batch_comparison(output, results):
         runs     = trials.groupby(['run_id','subject','block_type','class','channel','band'], as_index=False).erd_percent.mean()
         subjects = runs.groupby(['subject','block_type','class','channel','band'], as_index=False).erd_percent.mean()
         subjects.to_csv(Path(output) / 'erd_subjects.csv', index=False)
-        for (block, band, channel), sub in subjects.groupby(['block_type','band','channel']):
-            fig = go.Figure()
-            for cls, values in sub.groupby('class'):
-                fig.add_trace(go.Scatter(x=values.subject, y=values.erd_percent, mode='markers', name=cls, marker=dict(color=COLORS[cls],size=11)))
-            fig.add_hline(y=0, line_dash='dot', line_color='#555555')
-            fig.update_layout(title=f'{block} · {channel} · {band}', height=400, yaxis_title='ERD/ERS (%) · média por sujeito', xaxis_title='Sujeito')
-            report.add_plotly(fig, f'ERD/ERS · {block} · {channel} · {band}')
-    report.save(Path(output) / 'comparison.html')
+        import matplotlib.pyplot as plt
+        for block, block_data in trials.groupby('block_type'):
+            channels, bands = list(block_data.channel.unique()), list(block_data.band.unique())
+            classes = list(block_data["class"].unique())
+            fig, axes = plt.subplots(len(bands) * len(classes), len(channels), figsize=(5 * len(channels), 3 * len(bands) * len(classes)), squeeze=False, layout="constrained")
+            for ki, cls in enumerate(classes):
+                for bi, band in enumerate(bands):
+                    for ci, channel in enumerate(channels):
+                        ax = axes[ki * len(bands) + bi, ci]
+                        part = block_data[(block_data.band == band) & (block_data.channel == channel) & (block_data['class'] == cls)]
+                        for (subject, session, run_id), values in part.groupby(['subject','session','run_id']):
+                            ax.scatter(values.trial, values.erd_percent, label=f"{subject} / {session} / {run_id}", s=15, alpha=.7)
+                        ax.axhline(0, color='.5', lw=.7)
+                        ax.set(title=f"{cls} · {channel} · {band}", xlabel="Trial cronológico no registro", ylabel="ERD/ERS ativo (%)")
+            axes[0, -1].legend(fontsize=5, loc="upper left", bbox_to_anchor=(1, 1))
+            fig.suptitle(f"{block} · evolução por tentativa · médias no intervalo ativo auditado; trials dependentes")
+            report.add_figure(fig, title=f"ERD/ERS · evolução nas tentativas · {block}")
+            plt.close(fig)
+    report.add_html(pd.DataFrame([{k: r.get(k, "") for k in ["subject", "session", "block_type", "run_id", "status", "accepted_epochs"]} for r in results]).to_html(index=False), title="Registros · inclusão e disponibilidade")
+    links = []
+    for result in results:
+        rid = html.escape(result["run_id"], quote=True)
+        target = "report.html" if result.get("status", "ok") == "ok" else "diagnostics.json"
+        links.append(f'<li>{html.escape(result["subject"])} · {html.escape(result["session"])} · {html.escape(result["block_type"])}: <a href="{rid}/{target}">{rid}</a> · {html.escape(result.get("status", "ok"))}</li>')
+    report.add_html('<ul>' + ''.join(links) + '</ul><p><a href="diagnostics.html">Diagnóstico completo</a> · CSV/JSON preservam auditoria.</p>', title="Relatórios individuais")
+    report.items.insert(1, ("Resumo · registros", pd.DataFrame([{k: r.get(k, "") for k in ["subject", "session", "block_type", "status", "accepted_epochs"]} for r in results]).to_html(index=False), True))
+    report.save(Path(output) / 'index.html')
+    # Compatibility entry; no second independent report to navigate.
+    (Path(output) / 'comparison.html').write_text('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=index.html"><a href="index.html">Relatório geral completo</a>', encoding="utf-8")
 
 
