@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from reporting import Report, timeline_plot, batch_comparison
-from analysis_views import stacked_snapshot, epoch_panels, tangent_pca, robust_limit
+from analysis_views import stacked_snapshot, epoch_panels, tangent_pca, robust_limit, spectral_figures
 from eeg import COLORS, PROTOCOLS, fingerprint, load_run, make_epochs, scan, selection, settings
 
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 12, "axes.spines.top": False,
@@ -49,19 +49,25 @@ def quality_checks(run, audit, cfg):
     before    = run.raw.get_data() * 1e6
     after     = run.clean.get_data() * 1e6
     std       = after.std(axis=1)
+    amplitude = np.diff(np.quantile(before, [.25,.75], axis=1),axis=0)[0] * .7413
+    spread = float(np.subtract(*np.quantile(amplitude,[.75,.25])) * .7413)
+    robust_z = (amplitude-np.median(amplitude))/spread if spread > 1e-12 else np.full(len(amplitude),np.nan)
+    near_constant = np.ptp(before,axis=1) < cfg['flat_uv']
+    flags = ['quase constante' if flat else ('amplitude atípica; revisar' if np.isfinite(z) and abs(z)>5 else 'sem alerta relativo') for flat,z in zip(near_constant,robust_z)]
     ratio     = std / max(np.median(std), 1e-12)
     freq, psd = welch(before, fs=run.raw.info['sfreq'], nperseg=min(before.shape[-1], int(4 * run.raw.info['sfreq'])), axis=-1)
     total     = psd[:, (freq >= 1) & (freq < min(100, run.raw.info['sfreq'] / 2))].sum(axis=1)
     line      = psd[:, ((abs(freq - 50) <= 1) | (abs(freq - 60) <= 1))].sum(axis=1) / np.maximum(total, 1e-20) * 100
     if "source_line_noise_percent" in run.qc:
-        line=np.array([run.qc["source_line_noise_percent"][name] for name in run.raw.ch_names])
+        line=np.array([run.qc["source_line_noise_percent"][name] for name in run.raw.ch_names],dtype=float)
     rejected  = [sum(name in str(reason).split(';') for reason in audit.drop_reason) for name in run.raw.ch_names]
     frame     = pd.DataFrame(dict(channel=run.raw.ch_names, raw_dc_uv=np.median(before, axis=1),
                               raw_std_uv=before.std(axis=1), clean_std_uv=std, relative_std=ratio,
                               raw_peak_to_peak_uv=np.ptp(before, axis=1), clean_peak_to_peak_uv=np.ptp(after, axis=1),
+                              robust_amplitude_uv=amplitude, robust_deviation=robust_z, near_constant=near_constant,
                               line_noise_percent=line, rejected_epochs=rejected,
                               excluded=[c in run.raw.info['bads'] for c in run.raw.ch_names],
-                              flag=['variação baixa' if v < .2 else ('variação alta' if v > 5 else 'sem alerta relativo') for v in ratio]))
+                              flag=flags))
     fig, axes = plt.subplots(3, 1, figsize=(13, 10), layout='constrained')
     x         = np.arange(len(frame))
     axes[0].bar(x - .18, frame.raw_std_uv, .36, color='0.6', label='Antes')
@@ -69,7 +75,7 @@ def quality_checks(run, audit, cfg):
     axes[0].set(yscale='log', ylabel='Desvio-padrão (µV)', title='Variação por canal · escala logarítmica; offsets DC na tabela')
     axes[0].legend()
     axes[1].bar(x, line, color='0.45')
-    axes[1].set(ylabel='% da potência 1–100 Hz', title='Ruído estreito em 50/60 Hz ±1 Hz · sinal antes do filtro')
+    axes[1].set(ylabel='% da potência 1–100 Hz', title=f'Rede 50/60 Hz ±1 Hz · aquisição {run.qc.get("source_sfreq",run.raw.info["sfreq"]):.0f} Hz · antes de antialias/low-pass')
     axes[2].bar(x, rejected, color='0.45')
     axes[2].set(ylabel='Épocas rejeitadas', title=f'{int((~audit.accepted).sum())}/{len(audit)} épocas rejeitadas · contribuição por canal (pode haver múltiplas causas)')
     for ax in axes:
@@ -191,17 +197,21 @@ def classifier_figure(summary, predictions, cfg):
         axes[0].text(j, i, f"{cm[i, j]}\n{norm[i, j]:.0%}", ha="center", va="center", color="white" if norm[i, j] > 0.5 else "black")
     axes[0].set(xticks=range(len(labels)), xticklabels=labels, yticks=range(len(labels)), yticklabels=labels,
                    xlabel="Predito", ylabel="Real", title="Matriz por trial/fase · probabilidades médias")
-    scores = [f["balanced_accuracy"] for f in summary["folds"]]
-    axes[1].scatter(np.linspace(-.12, .12, len(scores)), scores, color="0.3")
-    axes[1].axhline(np.mean(scores), color="#0072B2", label="Média dos folds")
-    axes[1].set_xticks([0], ["Folds externos (dependentes)"])
+    scores = [summary["balanced_accuracy"]] if summary["validation"] == "prior_calibration_proxy" else [f["balanced_accuracy"] for f in summary["folds"]]
+    if len(scores)>1:
+        axes[1].boxplot([scores],positions=[0],widths=.4,showfliers=False)
+    axes[1].scatter((np.linspace(-.12, .12, len(scores)) if len(scores)>1 else [0]), scores, color="0.3")
+    if len(scores)>1:
+        axes[1].scatter([0],[np.mean(scores)],color='#0072B2',marker='D',label='Média dos folds')
+        axes[1].legend()
+    axes[1].set_xticks([0], ["Teste online único" if summary["validation"] == "prior_calibration_proxy" else "CV aninhada · folds dependentes"])
     axes[1].axhline(summary["chance"], color="0.5", ls="--")
     axes[1].set(ylim=(0, 1), xlabel="Dispersão dos folds · sem inferência independente", ylabel="Balanced accuracy", title=f"BA agrupada: {summary['balanced_accuracy']:.3f}")
     fig.suptitle(f"{summary['protocol']} · {summary['validation']} · fonte REST: {summary['rest_source']}")
     return fig
 
 
-def detailed_trials(run, before, after, report):
+def detailed_trials(run, before, after, report, directory=None):
     picks=central_picks(before.info) or list(mne.pick_types(before.info,eeg=True,exclude='bads')[:3])
     raw=before.get_data(picks=picks)*1e6
     cleaned=[]
@@ -218,7 +228,8 @@ def detailed_trials(run, before, after, report):
             axes[j,col].set(title=f'{before.ch_names[ch]} · {label}',xlabel='ATTEMPT (s)',ylabel='Trial (ID original)')
             axes[j,col].set_yticks(range(len(before)),before.metadata.trial.astype(str))
     fig.colorbar(im,ax=axes.ravel().tolist(),label='µV · escala comum P99; inclui épocas rejeitadas')
-    report.add_figure(fig,'Épocas · antes/depois conjuntos')
+    if directory is not None:
+        fig.savefig(Path(directory)/'epoch_audit.png',dpi=100)
     plt.close(fig)
 
 
@@ -281,7 +292,8 @@ def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocol
     if len(epochs) < 2:
         raise ValueError("Menos de duas épocas aceitas; consultar epoch_audit.csv.")
     project = row.get('project','Brasil')
-    report = Report(f"{project} · {row.subject} · {row.session} · {row.block_type} · {row.run_id}")
+    project_short = {"Brasil":"BR","Italia":"IT"}.get(project,project)
+    report = Report(f"{project_short} · {row.subject} · {row.session} · {row.block_type} · {row.run_id}")
     provenance = dict(config=cfg, qc=run.qc, control=row.to_dict(),
                       files={name:fingerprint(Path(root)/row[name]) for name in ['signal_path','marker_path']},
                       versions={p:importlib.metadata.version(p) for p in ['mne','numpy','scipy','scikit-learn','pyriemann']})
@@ -303,10 +315,12 @@ def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocol
     report.add_html(f"<p>Alertas de variação relativa: {html.escape(', '.join(flagged) or 'nenhum')}. "
                     f"Motivos de rejeição: {html.escape(str(audit.loc[~audit.accepted,'drop_reason'].value_counts().to_dict()))}. "
                     'Não há exclusão automática de canais.</p>', '✅ Qualidade e alertas')
+    report.add_html(quality[['channel','robust_amplitude_uv','robust_deviation','line_noise_percent','rejected_epochs','flag']].round(2).to_html(index=False,na_rep='não mensurável')+'<p>Amplitude robusta = IQR × 0,7413 (µV), desvio relativo em unidades IQR × 0,7413 entre canais; |desvio| > 5 é sinal de revisão inspirado em PREP, não diagnóstico. Quase constante: pico a pico de aquisição abaixo de flat_uv configurado. Rede: Welch 4 s; % da potência 1–min(100, Nyquist) Hz; indisponível sem suporte para ambas as bandas ±1 Hz de 50/60 Hz. Diferenças fisiológicas e referência influenciam amplitudes; alertas nunca excluem canais.</p>','Qualidade · indicadores descritivos')
     save_figure(qfig,directory,'sanity_checks',cfg,report)
     save_figure(stacked_snapshot(run),directory,'raw_antes_depois',cfg,report)
     basic_items=list(report.items)
     metrics,power,primary=[],None,None
+    failures=[]
     if mode in {'both','ephys'}:
         erp_audit=[]
         for row_epoch in epochs.metadata.itertuples():
@@ -319,12 +333,14 @@ def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocol
         pd.DataFrame(erp_audit).to_csv(directory/'erp_baseline_audit.csv',index=False)
         report.add_html(f"<p>ERP: {sum(r['valid'] for r in erp_audit)}/{len(erp_audit)} baselines utilizáveis; intervalos e exclusões em erp_baseline_audit.csv.</p>",'ERP · referência e suporte')
         save_figure(epoch_panels(epochs,cfg),directory,'erp_canais_classes',cfg,report)
+        for name,fig in spectral_figures(epochs,cfg):
+            save_figure(fig,directory,name,cfg,report)
         try:
             if row.block_type.startswith('online_') and training_epochs is None:
                 raise ValueError('PCA de teste indisponível: IM_treino anterior não disponível; não ajustar no online.')
             pfig,pdata=tangent_pca(classification_epochs,cfg,directory,training_epochs)
-            report.add_plotly(pfig,'PCA · TGSP · projeção em teste e KDE')
-            report.add_html('<p>Pontos são janelas reais deslizantes de até 1 s, passo 250 ms; não são trials independentes. Cor clara → escura indica cronologia dentro da classe; hover mostra trial e janela. Clique na legenda para isolar uma classe. KDE é descritiva, não aumenta a amostra. Referência tangente, scaler e PCA são ajustados somente no treino; IDs em pca_windows.csv.</p>','PCA · interpretação')
+            report.add_plotly(pfig,'PCA · TGSP · centroides e dispersão em teste')
+            report.add_html('<p>Pontos são janelas reais deslizantes de até 1 s, passo 250 ms; não são trials independentes. Cores distinguem classes; hover mostra trial e janela. Clique na legenda para isolar uma classe. Centroide e covariância atribuem peso total igual a cada trial. Elipse de 1 DP é dispersão descritiva, não intervalo de confiança; omitida com menos de três trials ou covariância singular. Referência tangente, scaler e PCA são ajustados somente no treino; IDs em pca_windows.csv.</p>','PCA · interpretação')
             fig,ax=plt.subplots(figsize=(10,6),layout='constrained')
             for cls,part in pdata.groupby('cls'):
                 ax.scatter(part.PC1,part.PC2,color=COLORS[cls],label=cls,alpha=.6)
@@ -365,24 +381,33 @@ def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocol
                         save_figure(classifier_figure(result[0],result[1],cfg),directory,f'classificacao_{prefix}{protocol}',cfg,report,title=f'{protocol} · BACC e folds externos')
                         fixed=result[0]['fixed_parameter_cv']
                         report.add_html(fixed_cv_table(fixed),f'{protocol} · CV de parâmetros fixos (seleção)')
-                        report.add_html(pd.DataFrame([dict(**result[0]['deployment_params'],treino=train_source,papel=result[0]['continuous_role'])]).to_html(index=False),f'{protocol} · modelo fixo da timeline')
-                        continuous=pd.DataFrame(result[0]['_continuous_timeline'])
-                        report.add_plotly(timeline_plot(result[0],continuous,cfg,run.trials),f'{protocol} · timeline contínua')
-                        metrics.append(dict(protocol=protocol,pipeline=variant,classifier=classifier,status='ok',balanced_accuracy=result[0]['balanced_accuracy'],chance=result[0]['chance'],validation=result[0]['validation'],train_source=train_source,n_trials=result[0]['n_trials']))
+                        report.add_html(pd.DataFrame([dict(**result[0]['deployment_params'],treino=train_source,papel=result[0]['continuous_role'])]).to_html(index=False),f'{protocol} · parâmetros selecionados')
+                        if variant == 'tgsp' and classifier == 'svm_rbf':
+                            continuous=pd.DataFrame(result[0]['_continuous_timeline'])
+                            report.add_plotly(timeline_plot(result[0],continuous,cfg,run.trials),f'{protocol} · timeline contínua')
+                        selection_scores=pd.DataFrame(fixed)
+                        from classify import parameter_id
+                        selected=selection_scores[selection_scores.candidate_id==parameter_id(result[0]['deployment_params'])] if len(selection_scores) else pd.DataFrame()
+                        means=selected.balanced_accuracy if len(selected) and selected.status.eq('ok').all() else pd.Series(dtype=float)
+                        metrics.append(dict(selection_cv_bacc=float(means.mean()) if len(means) else None,protocol=protocol,pipeline=variant,classifier=classifier,status='ok',balanced_accuracy=result[0]['balanced_accuracy'],chance=result[0]['chance'],validation=result[0]['validation'],train_source=train_source,n_trials=result[0]['n_trials']))
                     except (ValueError,np.linalg.LinAlgError) as exc:
-                        metrics.append(dict(protocol=protocol,pipeline=variant,classifier=classifier,status=str(exc)))
+                        from classify import phase_target
+                        source='REST_STIM' if (run.trials.trial_class=='REST_STIM').any() else 'REST'
+                        available={phase_target(t.trial_class,phase,protocol,source) for t in run.trials.itertuples() if t.trial in set(classification_epochs.metadata.trial) for phase in ['ATTENTION','ATTEMPT','PAUSE']}
+                        missing=set(PROTOCOLS[protocol])-available
+                        status='Indisponível: '+', '.join(sorted(missing))+' ausente' if missing else 'Erro de execução; consultar auditoria'
+                        failures.append(dict(protocol=protocol,pipeline=variant,classifier=classifier,error=str(exc),traceback=traceback.format_exc()))
+                        metrics.append(dict(protocol=protocol,pipeline=variant,classifier=classifier,status=status))
                 combine_sections(report,first,f'{variant.upper()} + {classifier} · protocolos lado a lado')
         report.add_html(metric_table(pd.DataFrame(metrics)), 'Classificação · resultados e impedimentos')
     elif row.block_type=='EM_treino':
         report.add_html('<p>EM_treino é screening eletrofisiológico de movimento. O modelo é treinado no IM_treino; performance online aparece nos blocos de teste da sessão.</p>','Screening · EM_treino')
-    # A compact quick-check thumbnail; the full electrophysiology belongs to the session report.
-    dashboard=stacked_snapshot(run)
-    save_figure(dashboard,directory,'dashboard',cfg)
     if detailed:
-        detailed_trials(run,before,epochs,report)
+        detailed_trials(run,before,epochs,report,directory)
+    (directory/'classification_failures.json').write_text(json.dumps(failures,indent=2,ensure_ascii=False))
     status=[dict(análise='Eletrofisiologia',resultado='executada' if mode!='classification' else 'não solicitada'),
             dict(análise='ERD/ERS',resultado='executada' if power is not None else 'não solicitada ou baseline indisponível'),
-            dict(análise='Classificação',resultado='screening; não ajustada' if row.block_type=='EM_treino' else '; '.join(f"{m['pipeline']} + {m['classifier']} / {m['protocol']}: {m['status']}" for m in metrics) or 'não solicitada')]
+            dict(análise='Classificação',resultado='screening; não ajustada' if row.block_type=='EM_treino' else (f"{sum(m['status']=='ok' for m in metrics)} disponíveis; {sum(m['status'].startswith('Indisponível:') for m in metrics)} indisponíveis; {sum(m['status'].startswith('Erro') for m in metrics)} erros" if metrics else 'não solicitada'))]
     report.items.insert(2,('Resumo · análises e disponibilidade',pd.DataFrame(status).to_html(index=False),True))
     report.add_html('<p>Auditoria: parameters_qc.json, trials.csv, epoch_audit.csv, channel_quality.csv, baseline_audit.csv; *_fixed_cv.csv preserva cada fold e parametrização. Decisões e valores extremos não são removidos dos arquivos.</p>','Auditoria · arquivos')
     provenance['classification']=metrics
@@ -395,7 +420,7 @@ def analyze_run(root, row, cfg, directory, mode="both", detailed=False, protocol
     return dict(project=project,run_id=row.run_id,subject=row.subject,session=row.session,block_type=row.block_type,
                 status='ok',total_epochs=len(run.trials),eligible_epochs=len(audit),accepted_epochs=len(epochs),
                 rejected_epochs=int((~audit.accepted).sum()),excluded_trials=int((~run.trials.valid).sum()),
-                bad_channels=run.qc['bad_channels'],quality_flags=flagged,classification=metrics)
+                bad_channels=run.qc['bad_channels'],quality_flags=flagged,analyses=status,classification=metrics)
 
 
 def fixed_cv_table(records):

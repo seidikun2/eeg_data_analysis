@@ -72,7 +72,7 @@ with tab_analysis:
     st.write("Os filtros da barra lateral são aplicados aos registros incluídos na tabela salva. O relatório geral reúne todos os registros selecionados.")
     mode      = st.selectbox("Análises", ["both", "ephys", "classification"],
                         format_func=lambda s: {"both": "Eletrofisiologia + classificação", "ephys": "Eletrofisiologia", "classification": "Classificação"}[s])
-    detailed = st.checkbox("Incluir inspeção conjunta das épocas antes/depois", value=True)
+    detailed = st.checkbox("Salvar figura de épocas na auditoria (fora do relatório)", value=True)
     protocols = st.multiselect("Protocolos", list(PROTOCOLS), default=["left_right"])
     compare = st.checkbox("Batch comparativo: avaliar TGSP e CSP separadamente", value=False,
                           help="Inclui TGSP e CSP no relatório geral e nas tabelas por sujeito; busca aninhada em cada pipeline. Mais demorado.")
@@ -135,7 +135,9 @@ with tab_results:
         output  = st.selectbox("Execução", choices, format_func=lambda p: p.name)
         if (output / "diagnostics.json").exists():
             diagnostic_rows = json.loads((output / "diagnostics.json").read_text())
-            with st.container():
+            if isinstance(diagnostic_rows,dict):
+                diagnostic_rows=[diagnostic_rows]
+            with st.expander("Diagnóstico detalhado e auditoria"):
                 st.dataframe(pd.DataFrame([dict(run_id=r["run_id"], **c) for r in diagnostic_rows for c in r["checks"]]), hide_index=True)
                 st.download_button("Baixar diagnóstico completo", (output / "diagnostics.json").read_bytes(), "diagnostics.json", "application/json", key="saved_diagnostics")
         results = json.loads((output / "batch_results.json").read_text()) if (output / "batch_results.json").exists() else []
@@ -152,13 +154,20 @@ with tab_results:
             st.download_button("Baixar relatório geral do batch", (output / "index.html").read_bytes(), "index.html", "text/html")
         for result in visible:
             with st.container():
-                st.subheader(result["run_id"])
+                st.subheader(f"{dict(Brasil='BR', Italia='IT').get(result.get('project','Brasil'), result.get('project'))} · {result['subject']} · {result['session']} · {result['block_type']}")
+                st.caption(result["run_id"])
                 if result["status"] != "ok":
                     st.error(result["status"])
                     continue
                 folder = output / result["run_id"]
-                st.caption("Baixe e abra o HTML no navegador para zoom, inspeção do raw e traçados contínuos. As imagens abaixo são resumos estáticos.")
-                st.image(str(folder / "dashboard.png"))
+                st.caption("Baixe e abra o HTML no navegador para zoom, inspeção do raw e traçados contínuos. CV de seleção, CV aninhada e teste online têm papéis distintos.")
+                counts=st.columns(3)
+                for column,key,label in zip(counts,['total_epochs','accepted_epochs','rejected_epochs'],['Épocas totais','Aceitas','Rejeitadas']):
+                    column.metric(label,result.get(key,'—'))
+                st.caption(f"Canais excluídos: {', '.join(result.get('bad_channels',[])) or 'nenhum'} · Alertas: {', '.join(result.get('quality_flags',[])) or 'nenhum'}")
+                st.dataframe(pd.DataFrame(result.get('analyses',[])),hide_index=True)
+                if (folder/'report.html').exists():
+                    st.download_button('Baixar relatório individual completo',(folder/'report.html').read_bytes(),f"{result['run_id']}_report.html",'text/html',key=f"report_{result['run_id']}")
                 session_file=output/f"session_{result.get('project','Brasil')}_{result['subject']}_{result['session']}.html"
                 if session_file.exists():
                     st.download_button("Baixar relatório da sessão",session_file.read_bytes(),session_file.name,"text/html",key=f"session_{result['run_id']}")

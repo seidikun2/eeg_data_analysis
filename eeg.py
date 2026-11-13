@@ -282,7 +282,10 @@ def load_run(root, row, cfg):
     frequency,spectrum=welch(data,fs=sfreq,nperseg=min(len(times),round(4*sfreq)),axis=-1)
     total=spectrum[:,(frequency>=1)&(frequency<min(100,sfreq/2))].sum(axis=1)
     line=spectrum[:,(np.abs(frequency-50)<=1)|(np.abs(frequency-60)<=1)].sum(axis=1)/np.maximum(total,1e-30)*100
-    source_line_noise=dict(zip(names,line.tolist()))
+    # A full ±1 Hz band must fit below source Nyquist; unavailable is not zero.
+    if sfreq/2 <= 61 or len(times)/sfreq < 2:
+        line[:]=np.nan
+    source_line_noise=dict(zip(names,[float(v) if np.isfinite(v) else None for v in line]))
     factor = cfg.get("analysis_decimation", "auto")
     factor = (2 if sfreq >= 250 else 1) if factor == "auto" else int(factor)
     if factor not in {1, 2}:

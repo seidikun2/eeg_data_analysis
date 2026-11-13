@@ -42,7 +42,7 @@ class Report:
         cards = [f'<section id="section-{i}"><h2>{html.escape(title)}</h2><div class="content">{content}</div></section>'
                  for i, (title, content, opened) in enumerate(self.items)]
         page  = '''<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{font:18px system-ui;color:#20252b;background:#f2f4f7;margin:0}main{max-width:1280px;margin:auto;padding:24px}h1{font-size:24px}section{background:white;border:1px solid #d6dbe1;border-radius:8px;margin:20px 0}h2{padding:18px;font-size:22px;margin:0}.content{padding:8px 20px 24px;overflow:auto}table{border-collapse:collapse;font-size:16px}th,td{padding:9px;border-bottom:1px solid #ddd;text-align:left}pre{white-space:pre-wrap;font-size:12px}img{max-width:100%;height:auto}.enlarge{border:0;background:white;cursor:zoom-in;width:100%}.hint{color:#505b66}.viewer{position:fixed;inset:0;background:#18202cfa;z-index:9999;display:none}.toolbar{height:52px;display:flex;gap:16px;align-items:center;padding:0 20px;color:white}.toolbar button{padding:8px 16px;cursor:pointer}.viewport{height:calc(100% - 52px);overflow:auto;cursor:grab}.viewport img{max-width:none;display:block}.pipeline-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,480px),1fr));gap:20px}.pipeline-grid .wide{grid-column:1/-1}.cards{display:flex;gap:20px;flex-wrap:wrap}.card{padding:16px;background:#f4f6f8;border-radius:6px;min-width:130px}.card strong{display:block;font-size:25px}</style>
+<style>body{font:18px system-ui;color:#20252b;background:#f2f4f7;margin:0}main{max-width:1280px;margin:auto;padding:24px}h1{font-size:24px}section{background:white;border:1px solid #d6dbe1;border-radius:8px;margin:12px 0}h2{padding:12px 16px;font-size:20px;margin:0}.content{padding:6px 16px 14px;overflow:auto}table{border-collapse:collapse;font-size:16px}th,td{padding:4px 8px;line-height:1.3;max-width:28em;overflow-wrap:break-word;border-bottom:1px solid #ddd;text-align:left}th{white-space:nowrap}pre{white-space:pre-wrap;font-size:12px}img{max-width:100%;height:auto}.enlarge{border:0;background:white;cursor:zoom-in;width:100%}.hint{color:#505b66}.viewer{position:fixed;inset:0;background:#18202cfa;z-index:9999;display:none}.toolbar{height:52px;display:flex;gap:16px;align-items:center;padding:0 20px;color:white}.toolbar button{padding:8px 16px;cursor:pointer}.viewport{height:calc(100% - 52px);overflow:auto;cursor:grab}.viewport img{max-width:none;display:block}.pipeline-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,480px),1fr));gap:20px}.pipeline-grid .wide{grid-column:1/-1}.cards{display:flex;gap:20px;flex-wrap:wrap}.card{padding:16px;background:#f4f6f8;border-radius:6px;min-width:130px}.card strong{display:block;font-size:25px}</style>
 <title>''' + html.escape(self.title) + '</title><script>' + get_plotlyjs() + '''</script><main><h1>''' + html.escape(self.title) + '''</h1>
 <p class="hint">Gráficos interativos: arraste para selecionar zoom; duplo clique restaura; legenda oculta/mostra traços. Figuras: clique para ampliar, use a roda para zoom e arraste para navegar. Seções visíveis; detalhes extensos nos arquivos CSV/JSON de auditoria.</p>''' + "".join(cards) + '''</main>
 <div class="viewer" role="dialog" aria-label="Figura ampliada"><div class="toolbar"><button id="close">Fechar (Esc)</button><button id="fit">Ajustar à tela</button><button id="plus">+</button><button id="minus">−</button><span id="zoom"></span></div><div class="viewport"><img alt="Figura ampliada"></div></div>
@@ -60,6 +60,7 @@ document.querySelectorAll('details').forEach(d=>d.addEventListener('toggle',()=>
 def metric_table(frame):
     if frame.empty:
         return '<p>Sem resultados disponíveis.</p>'
+    frame=frame.drop(columns=['params','traceback','error','deployment_params','candidate_id'],errors='ignore')
     if 'balanced_accuracy' not in frame:
         return frame.to_html(index=False,escape=True)
     def cell(value):
@@ -76,7 +77,7 @@ def combine_sections(report,first,title):
     report.items=report.items[:first]
     def order(item):
         name=item[0]
-        return 3 if 'timeline' in name else (2 if 'modelo fixo' in name else (1 if 'CV de parâmetros' in name else 0))
+        return 3 if 'timeline' in name else (2 if 'parâmetros selecionados' in name else (1 if 'CV de parâmetros' in name else 0))
     items=sorted(items,key=order)
     cells=[]
     for name,content,_ in items:
@@ -194,7 +195,9 @@ def batch_comparison(output, results):
     report.add_html('<p>Cada projeto/sujeito/sessão/registro permanece separado. EM_treino: screening; IM_treino: ajuste e CV; online: teste com calibração anterior identificada. CV de seleção não é teste independente. Folds e janelas não são réplicas independentes.</p>','Resumo · interpretação')
     columns=['project','subject','session','run_id','block_type','status','total_epochs','eligible_epochs','accepted_epochs','rejected_epochs','excluded_trials','bad_channels','quality_flags']
     summary=pd.DataFrame([{k:r.get(k,'Brasil' if k=='project' else '') for k in columns} for r in results])
-    report.add_html(summary.to_html(index=False),'Resumo · épocas totais, aceitas e qualidade')
+    display_summary=summary.copy()
+    display_summary['project']=display_summary.project.replace({'Brasil':'BR','Italia':'IT'})
+    report.add_html(record_table(display_summary),'Resumo · épocas totais, aceitas e qualidade')
     rows,erd,cv=[],[],[]
     for result in results:
         meta={k:result.get(k,'Brasil' if k=='project' else '') for k in ['project','subject','session','run_id','block_type']}
@@ -227,10 +230,11 @@ def batch_comparison(output, results):
     if len(trials):
         trials.to_csv(output/'erd_subjects.csv',index=False)
     for (project,subject),person in summary.groupby(['project','subject'],sort=False):
-        person_report=Report(f'{project} · {subject} · sessões')
+        project_label={'Brasil':'BR','Italia':'IT'}.get(project,project)
+        person_report=Report(f'{project_label} · {subject} · sessões')
         for session,session_rows in person.groupby('session',sort=False):
-            session_report=Report(f'{project} · {subject} · sessão {session}')
-            session_report.add_html(session_rows.to_html(index=False),'Resumo · blocos, repetições, qualidade e performance')
+            session_report=Report(f'{project_label} · {subject} · sessão {session}')
+            session_report.add_html(record_table(session_rows),'Resumo · blocos, repetições, qualidade e performance')
             session_performance=performance[performance.run_id.isin(session_rows.run_id)] if len(performance) else pd.DataFrame()
             if len(session_performance):
                 session_report.add_html(metric_table(session_performance.merge(session_rows[['run_id','total_epochs','accepted_epochs','bad_channels','quality_flags']],on='run_id',how='left')), 'Performance junto à qualidade por registro')
@@ -245,8 +249,8 @@ def batch_comparison(output, results):
                     session_report.add_html(session_rows[session_rows.run_id==rid].to_html(index=False),f'Registro · {rid} · indisponível')
             safe=re.sub(r'[^a-zA-Z0-9_-]','_',f'{project}_{subject}_{session}')
             session_report.save(output/f'session_{safe}.html')
-            person_report.add_html(f'<p><a href="session_{safe}.html">Abrir sessão {html.escape(session)}</a></p>'+session_rows.to_html(index=False),f'Sessão {session}')
-            report.add_html(f'<p><a href="session_{safe}.html">Relatório da sessão completo</a></p>',f'{project} · {subject} · {session}')
+            person_report.add_html(f'<p><a href="session_{safe}.html">Abrir sessão {html.escape(session)}</a></p>'+record_table(session_rows),f'Sessão {session}')
+            report.add_html(f'<p><a href="session_{safe}.html">Relatório da sessão completo</a></p>',f'{project_label} · {subject} · {session}')
         if len(performance):
             part=performance[(performance.project==project)&(performance.subject==subject)]
             for rid,run_metrics in part.groupby('run_id',sort=False):
@@ -261,47 +265,24 @@ def batch_comparison(output, results):
                         ax.axhline(values.chance.iloc[0],color='.5',ls=':')
                         ax.set(title=protocol,ylim=(0,1),ylabel='BACC por trial/fase')
                         ax.tick_params(axis='x',labelrotation=20)
-                    fig.suptitle(f'{project} · {subject} · {rid} · pipelines e classificadores separados')
+                    fig.suptitle('Performance · features e classificadores')
                     report.add_figure(fig,f'{subject} · {rid} · protocolos lado a lado');plt.close(fig)
-                report.add_html(metric_table(run_metrics),f'{subject} · {rid} · performance e impedimentos')
+                report.add_html(metric_table(run_metrics.drop(columns=['project','subject','session','run_id','block_type'],errors='ignore')),f'{subject} · {rid} · performance e impedimentos')
         if len(fixed):
             person_cv=fixed[(fixed.project==project)&(fixed.subject==subject)]
             for (rid,protocol),part in person_cv.groupby(['run_id','protocol'],sort=False):
                 valid=part[part.status=='ok'].copy()
                 if valid.empty:
                     continue
-                fig,ax=plt.subplots(figsize=(max(10,valid.candidate_id.nunique()*.6),5),layout='constrained')
-                keys=list(dict.fromkeys(valid.candidate_id))
-                for i,cid in enumerate(keys):
-                    scores=valid.loc[valid.candidate_id==cid,'balanced_accuracy']
-                    ax.scatter(i+np.linspace(-.12,.12,len(scores)),scores,color='#777777',s=25)
-                    ax.scatter([i],[scores.mean()],color='#D62728',s=65,marker='D')
-                ax.set(xticks=range(len(keys)),xticklabels=keys,ylim=(0,1),ylabel='BACC · folds cinza / média vermelha',title=f'{rid} · {protocol} · parâmetros fixos; CV de seleção')
-                ax.tick_params(axis='x',labelrotation=45,labelsize=10)
-                report.add_figure(fig,f'{subject} · {rid} · {protocol} · distribuição da CV por parâmetros');plt.close(fig)
-                params=valid.groupby('candidate_id',sort=False).first().reset_index()
-                report.add_html(params[['candidate_id','pipeline','classifier','window','offset','bands','C','gamma']].to_html(index=False),f'{rid} · {protocol} · chave dos parâmetros')
-        if len(trials):
-            person_erd=trials[(trials.project==project)&(trials.subject==subject)]
-            for rid,block_data in person_erd.groupby('run_id',sort=False):
-                channels,bands,classes=list(block_data.channel.unique()),list(block_data.band.unique()),list(block_data['class'].unique())
-                fig,axes=plt.subplots(len(bands)*len(classes),len(channels),figsize=(5*len(channels),3*len(bands)*len(classes)),squeeze=False,layout='constrained')
-                limit=max(1,float(np.quantile(np.abs(block_data.erd_percent),.99)))
-                for ki,cls in enumerate(classes):
-                    for bi,band in enumerate(bands):
-                        for ci,channel in enumerate(channels):
-                            ax=axes[ki*len(bands)+bi,ci]
-                            values=block_data[(block_data.band==band)&(block_data.channel==channel)&(block_data['class']==cls)].sort_values('trial')
-                            ax.scatter(values.trial,values.erd_percent,color=COLORS[cls],s=20,alpha=.5,label='Trials')
-                            if len(values)>=2:
-                                trend=values.erd_percent.rolling(min(5,len(values)),min_periods=1,center=True).mean()
-                                ax.plot(values.trial,trend,color='#222222',lw=2,label='Tendência móvel ≤5 trials')
-                            ax.axhline(0,color='.5',lw=.7)
-                            ax.set(title=f'{cls} · {channel} · {band}',xlabel='Trial no registro',ylabel='ERD/ERS ativo (%)',ylim=(-limit,limit))
-                axes[0,0].legend(fontsize=10)
-                fig.suptitle(f'{project} · {subject} · {rid} · tendências sem unir sujeitos ou repetições; escala P99')
-                report.add_figure(fig,f'ERD/ERS · evolução nas tentativas · {subject} · {rid}');plt.close(fig)
+                for classifier,group in valid.groupby('classifier',sort=False):
+                    fig=parameter_distribution(group,protocol,classifier)
+                    report.add_figure(fig,f'{subject} · {rid} · {protocol} · {classifier} · CV de seleção');plt.close(fig)
         person_report.save(output/f'subject_{project}_{subject}.html')
+    if len(fixed):
+        columns=[c for c in ['candidate_id','pipeline','classifier','window','offset','bands','C','gamma'] if c in fixed]
+        params=fixed[columns].drop_duplicates()
+        params.to_csv(output/'parameter_combinations.csv',index=False)
+        report.add_html('<details><summary>Combinações · auditoria comum</summary>'+params.to_html(index=False)+'</details>','Apêndice · parâmetros')
     links=[]
     for result in results:
         rid=html.escape(result['run_id'],quote=True)
@@ -310,3 +291,62 @@ def batch_comparison(output, results):
     report.add_html('<ul>'+''.join(links)+'</ul>','Relatórios individuais')
     report.save(output/'index.html')
     (output/'comparison.html').write_text('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=index.html"><a href="index.html">Relatório geral</a>',encoding='utf-8')
+
+
+def parameter_distribution(frame, protocol, classifier):
+    """Separate offsets and fixed band/feature/hyperparameter conditions; no connecting lines."""
+    import matplotlib.pyplot as plt
+    offsets=sorted(frame.offset.unique())
+    fig,axes=plt.subplots(1,len(offsets),squeeze=False,figsize=(max(8,5*len(offsets)),5),layout='constrained')
+    def label(row):
+        import ast
+        bank=ast.literal_eval(row.bands) if isinstance(row.bands,str) else row.bands
+        bands=' + '.join(f'{lo:g}–{hi:g}' for lo,hi in bank)+' Hz'
+        parts=[str(row.pipeline).upper(),bands]
+        if classifier!='lda' and 'C' in row and pd.notna(row['C']):
+            parts.append(f'C={row["C"]:g}')
+        if classifier=='svm_rbf' and 'gamma' in row and pd.notna(row.gamma):
+            parts.append(f'γ={row.gamma}')
+        return ' · '.join(parts)
+    frame=frame.copy()
+    frame['condition']=frame.apply(label,axis=1)
+    conditions=list(dict.fromkeys(frame.condition))
+    colors=plt.get_cmap('tab10')
+    windows=sorted(frame.window.unique())
+    for ax,offset in zip(axes[0],offsets):
+        part=frame[frame.offset==offset]
+        for ci,condition in enumerate(conditions):
+            subset=part[part.condition==condition]
+            for window,scores in subset.groupby('window'):
+                values=scores.balanced_accuracy.to_numpy(float)
+                x=windows.index(window)+(ci-(len(conditions)-1)/2)*(.7/max(1,len(conditions)))
+                color=colors(ci%10)
+                if len(values)>1:
+                    boxes=ax.boxplot([values],positions=[x],widths=.55/max(1,len(conditions)),showfliers=False,patch_artist=True,manage_ticks=False)
+                    boxes['boxes'][0].set(facecolor=color,alpha=.25)
+                ax.scatter(x+np.linspace(-.05,.05,len(values)),values,color=color,s=18)
+                ax.scatter([x],[values.mean()],color=color,marker='D',s=45,label=condition if window==subset.window.min() else None)
+        ax.set(xticks=range(len(windows)),xticklabels=[str(w) for w in windows],xlabel='Janela (s)',ylabel='BACC · seleção',ylim=(-.02,1.03),title=f'Offset {offset:g} s')
+    # Include conditions that only occur in other offsets.
+    mapping={}
+    for ax in axes[0]:
+        h,l=ax.get_legend_handles_labels();mapping.update(zip(l,h))
+    fig.legend(mapping.values(),mapping.keys(),loc='outside lower center',ncols=min(2,max(1,len(mapping))),fontsize=10)
+    fig.suptitle(f'{protocol} · {classifier} · folds dependentes; losango = média')
+    return fig
+
+
+def record_table(frame):
+    """Compact identity and essential QC; full rows remain in CSV/JSON."""
+    names={'project':'Projeto','subject':'Sujeito','session':'Sessão','block_type':'Bloco',
+           'run_id':'Registro','total_epochs':'Total','accepted_epochs':'Aceitas',
+           'rejected_epochs':'Rejeitadas','bad_channels':'Excluídos','quality_flags':'Alertas','status':'Status'}
+    view=frame[[c for c in names if c in frame]].copy()
+    if 'project' in view:
+        view['project']=view.project.replace({'Brasil':'BR','Italia':'IT'})
+    if 'run_id' in view:
+        view['run_id']=view.run_id.map(lambda rid:str(rid).rsplit('__',1)[-1])
+    for column in ['bad_channels','quality_flags']:
+        if column in view:
+            view[column]=view[column].map(lambda value: ', '.join(map(str,value)) or '—' if isinstance(value,(list,tuple)) else value)
+    return view.rename(columns=names).to_html(index=False,escape=True)

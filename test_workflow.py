@@ -136,11 +136,14 @@ def test_report_and_interface(tmp_path):
     results = batch(tmp_path, control, output, quick_config(), mode="ephys", detailed=True)
     assert results[0]["status"] == "ok"
     folder = output / results[0]["run_id"]
-    for name in ["report.html", "dashboard.png", "topografias_mu_beta.pdf", "pca_2d_3d.png", "baseline_audit.csv"]:
+    for name in ["report.html", "psd_welch.png", "topografias_mu_beta.pdf", "pca_2d_3d.png", "baseline_audit.csv"]:
         assert (folder / name).stat().st_size > 100
-    assert "Épocas · antes/depois conjuntos" in (folder / "report.html").read_text()
+    assert "Épocas · antes/depois conjuntos" not in (folder / "report.html").read_text()
     at = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
     at.sidebar.text_input[0].set_value(str(tmp_path)).run()
+    at.sidebar.text_input[1].set_value(str(tmp_path)).run()
+    assert len(at.metric)==3
+    assert [m.label for m in at.metric]==["Épocas totais","Aceitas","Rejeitadas"]
     assert not list(at.exception)
     assert [t.label for t in at.tabs] == ["Controle dos dados", "Verificar qualidade", "Produzir relatório", "Consultar resultados"]
 
@@ -278,6 +281,8 @@ def test_comparison_timeline_and_causal_smoothing(tmp_path):
     page = (folder/'report.html').read_text()
     assert 'plotly' in page.lower() and 'Raw antes/depois · zoom por canal' not in page  # modo classificação
     assert 'viewport' in page and 'svm_rbf' in page
+    assert page.count('timeline contínua</h3>')==1
+    assert 'Épocas · antes/depois conjuntos' not in page
 
 
 def test_context_trials_not_used_for_training_or_metrics(tmp_path):
@@ -327,9 +332,9 @@ def test_general_report_two_subjects_and_pipelines(tmp_path):
     assert all(len(r["classification"]) == 2 and all(m["status"] == "ok" for m in r["classification"]) for r in results)
     general = (output / "index.html").read_text()
     assert "AB01" in general and "CD02" in general
-    assert "evolução nas tentativas" in general
+    assert "evolução nas tentativas" not in general
     assert "Relatórios individuais" in general
-    assert "<details" not in general
+    assert "Combinações · auditoria comum" in general
     comparisons = pd.read_csv(output / "comparison_runs.csv")
     assert set(comparisons.subject) == {"AB01", "CD02"}
     assert set(comparisons.pipeline) == {"tgsp", "csp"}
@@ -476,7 +481,8 @@ def test_attention_baseline_and_pca_test_trials(tmp_path):
     test=windows[windows.role=='test']
     assert not set(train.trial)&set(test.trial)
     assert test.groupby('trial').size().min()>1
-    assert any(t.type=='contour' for t in fig.data)
+    assert not any(t.type=='contour' for t in fig.data)
+    assert any(t.marker.symbol=='x' for t in fig.data if t.mode=='markers')
     assert all(t.legendgroup for t in fig.data)
 
 
@@ -522,3 +528,104 @@ def test_session_screening_repetitions_and_online_channel_loss(tmp_path):
     qc=json.loads((output/test['run_id']/'parameters_qc.json').read_text())['qc']
     assert 'C3' not in qc['transfer_channels']
     assert 'C3' in qc['channels']  # original record is preserved for quality/snapshot
+
+
+def test_trial_weighted_dispersion_and_singular_support():
+    from analysis_views import trial_dispersion
+    frame=pd.DataFrame(dict(trial=[0,0,0,1,2],PC1=[0,0,0,6,0],PC2=[0,0,0,0,6]))
+    center,ellipse=trial_dispersion(frame)
+    assert np.allclose(center,[2,2])
+    assert ellipse is not None and ellipse.shape==(101,2)
+    assert trial_dispersion(frame[frame.trial<2])[1] is None
+    flat=frame.assign(PC2=0)
+    assert trial_dispersion(flat)[1] is None
+
+
+def test_display_preserves_samples_and_absolute_psd_units(tmp_path):
+    import matplotlib.pyplot as plt
+    from analysis_views import stacked_snapshot,spectral_figures
+    control=synthetic(tmp_path,n=8)
+    cfg=quick_config()
+    run=load_run(tmp_path,selection(control).iloc[0],cfg)
+    _,epochs,_=make_epochs(run,cfg)
+    original=run.raw.get_data().copy()
+    original_epochs=epochs.get_data().copy()
+    fig=stacked_snapshot(run)
+    assert 'Offsets entre canais' in fig.axes[0].texts[0].get_text()
+    plt.close(fig)
+    figures=spectral_figures(epochs,cfg)
+    psd=figures[0][1]
+    assert all(ax.get_ylabel()=='µV²/Hz' for ax in psd.axes)
+    from scipy.signal import welch
+    f,expected=welch(epochs['LEFT'].get_data(picks=['C3'])*1e6,fs=epochs.info['sfreq'],window='hann',nperseg=128,noverlap=64,scaling='density')
+    assert np.allclose(psd.axes[0].lines[0].get_ydata(),expected.mean(axis=0)[0])
+    for _,fig in figures: plt.close(fig)
+    assert np.array_equal(run.raw.get_data(),original)
+    assert np.array_equal(epochs.get_data(),original_epochs)
+
+
+def test_quality_alerts_are_descriptive_and_preserve_exclusions(tmp_path):
+    import matplotlib.pyplot as plt
+    from analyze import quality_checks
+    control=synthetic(tmp_path,n=4)
+    cfg=quick_config()
+    run=load_run(tmp_path,selection(control).iloc[0],cfg)
+    _,_,audit=make_epochs(run,cfg)
+    run.raw._data[0]=0
+    bads=list(run.raw.info['bads'])
+    quality,fig=quality_checks(run,audit,cfg)
+    assert quality.near_constant.iloc[0]
+    assert quality.flag.iloc[0]=='quase constante'
+    assert 'robust_deviation' in quality
+    assert run.raw.info['bads']==bads
+    assert np.allclose(quality.line_noise_percent,[run.qc['source_line_noise_percent'][n] for n in run.raw.ch_names])
+    plt.close(fig)
+
+
+def test_erd_zero_lines_and_no_trial_heatmap(tmp_path):
+    import matplotlib.pyplot as plt
+    from analyze import time_frequency
+    from analysis_views import epoch_panels
+    control=synthetic(tmp_path,n=4)
+    cfg=quick_config()
+    run=load_run(tmp_path,selection(control).iloc[0],cfg)
+    _,epochs,_=make_epochs(run,cfg)
+    power,_=time_frequency(run,epochs,cfg)
+    fig=epoch_panels(power,cfg,power=True)
+    assert len(fig.axes)==2*len(power.event_id)
+    for ax in fig.axes:
+        assert not ax.images
+        zeros=[line.get_ydata()[0] for line in ax.lines if line.get_linestyle()==':']
+        assert set(ax.get_yticks()).issubset(zeros)
+    plt.close(fig)
+
+
+def test_parameter_panels_use_meaningful_labels_without_lines():
+    import matplotlib.pyplot as plt
+    from reporting import parameter_distribution
+    frame=pd.DataFrame([dict(window=w,offset=o,pipeline=p,bands='[[8,30]]',C=1,gamma='scale',balanced_accuracy=score)
+        for w in [1,1.5] for o in [0,.5] for p in ['tgsp','csp'] for score in [.5,.75]])
+    fig=parameter_distribution(frame,'left_right','svm_rbf')
+    assert len(fig.axes)==2
+    assert all(ax.get_xlabel()=='Janela (s)' for ax in fig.axes)
+    assert {ax.get_title() for ax in fig.axes}=={'Offset 0 s','Offset 0.5 s'}
+    assert not any('candidate' in text.get_text() for text in fig.findobj() if hasattr(text,'get_text'))
+    plt.close(fig)
+
+
+def test_line_noise_unavailable_below_source_nyquist(tmp_path):
+    from analyze import quality_checks
+    import matplotlib.pyplot as plt
+    control=synthetic(tmp_path,n=4)
+    row=selection(control).iloc[0]
+    path=tmp_path/row.signal_path
+    data=pd.read_csv(path)
+    data['lsl_time_s']=1000+np.arange(len(data))/100
+    data.to_csv(path,index=False)
+    cfg=quick_config()
+    run=load_run(tmp_path,row,cfg)
+    assert all(value is None for value in run.qc['source_line_noise_percent'].values())
+    _,_,audit=make_epochs(run,cfg)
+    frame,fig=quality_checks(run,audit,cfg)
+    assert frame.line_noise_percent.isna().all()
+    plt.close(fig)
